@@ -1,0 +1,38 @@
+{
+  "name": "Neuways-crm-server",
+  "version": "1.0.0",
+  "description": "Backend API for Neuways CRM",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "node dist/tests/security-phase4.test.js && node dist/tests/transaction-helper.test.js && node dist/tests/enquiry-phase3.test.js && node dist/tests/enquiry-remark.test.js && node dist/tests/enquiry-activity-safeguards.test.js && node dist/tests/enquiry-assign.test.js && node dist/tests/auth.test.js && node dist/tests/google-auth.test.js && node dist/tests/user-provisioning.test.js && node dist/tests/enquiry-route.test.js && node dist/tests/enquiry-controller.test.js && node dist/tests/enquiry-service.test.js && node dist/tests/employee-lead-isolation.test.js && node dist/tests/lead-workflow.test.js && node dist/tests/dashboard-and-completed-deals.test.js && node dist/tests/admin-dashboard.test.js && node dist/tests/lead-qualification.test.js && node dist/tests/global-search.test.js && node dist/tests/notification.test.js && node dist/tests/lead-rejection.test.js && node dist/tests/manager-dashboard.test.js && node dist/tests/property-round-robin.test.js && node dist/tests/sales-agent-properties.test.js && node dist/tests/company-permissions-audit.test.js && node dist/tests/manager-reassign-deactivation.test.js && node dist/tests/network-resilience-auth.test.js && node dist/tests/dashboard-performance.test.js && node dist/tests/task-idempotency.test.js && node dist/tests/duplicate-data-and-re-enquiry.test.js && node dist/tests/bulk-import.test.js && node dist/tests/task-status-tracking.test.js && node dist/tests/meeting-site-visit-cancellation.test.js && node dist/tests/rejected-deal-lost.test.js && node dist/tests/do-not-contact.test.js",
+    "create-admin": "tsx src/scripts/create-admin.ts"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "google-auth-library": "^11.3.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.12.0",
+    "multer": "^2.5.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
