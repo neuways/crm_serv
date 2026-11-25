@@ -15,8 +15,25 @@ import {
   IGoogleTokenVerifier
 } from '../types/auth.types.js';
 
-const BCRYPT_SALT_ROUNDS = 12;
-const JWT_EXPIRES_IN = '8h';
+export const BCRYPT_SALT_ROUNDS = 12;
+export const JWT_EXPIRES_IN = '7d';
+export const AUTH_COOKIE_NAME = 'nueways_session';
+export const AUTH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+
+export const getAuthCookieOptions = () => ({
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  maxAge: AUTH_COOKIE_MAX_AGE_MS,
+  path: '/'
+});
+
+export const getClearCookieOptions = () => ({
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  path: '/'
+});
 
 /**
  * Production implementation verifying Google ID tokens via Google's official JWKS certificates.

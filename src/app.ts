@@ -9,6 +9,7 @@ import { userRouter } from "./routes/user.routes.js";
 import { notificationRouter } from "./routes/notification.routes.js";
 import { propertyMappingRouter } from "./routes/property-mapping.routes.js";
 import { bulkImportRouter } from "./routes/bulk-import.routes.js";
+import { parseCookies } from "./middlewares/auth.middleware.js";
 
 export const createApp = (): Application => {
   const app = express();
@@ -49,6 +50,12 @@ export const createApp = (): Application => {
 
   // 2. Controlled JSON Request Body Parser (Runs BEFORE all application routers)
   app.use(express.json({ limit: "50kb" }));
+
+  // Native Zero-Dependency Cookie Parser (Populates req.cookies for all routes)
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    req.cookies = parseCookies(req.headers.cookie);
+    next();
+  });
 
   // 3. Health-Check Endpoint (Reports actual database connectivity)
   app.get("/api/v1/health", (_req: Request, res: Response) => {

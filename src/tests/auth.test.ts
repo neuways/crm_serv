@@ -493,8 +493,162 @@ async function runAuthTests() {
       "Enquiry response envelope intact",
     );
 
+    // ---------------------------------------------------------------
+    // Suite 6: Persistent Cookie Session, /auth/me & /auth/logout
+    // ---------------------------------------------------------------
+    console.log("\n--- Suite 6: Persistent Cookie Session, /auth/me & /auth/logout ---");
+
+    activeSalesUser.passwordHash = hash;
+
+    // 6.1: Login endpoint sets persistent HttpOnly cookie
+    User.findOne = ((query: any) => ({
+      select: () => {
+        if (query.email === activeSalesUser.email) {
+          return Promise.resolve(activeSalesUser);
+        }
+        return Promise.resolve(null);
+      },
+    })) as any;
+
+    User.findById = ((id: any) => ({
+      select: () => {
+        if (id.toString() === activeSalesUser.id) {
+          return Promise.resolve(activeSalesUser);
+        }
+        return Promise.resolve(null);
+      },
+    })) as any;
+
+    const loginRes = await fetch(`${baseUrl}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: activeSalesUser.email,
+        password: plainPassword,
+      }),
+    });
+
+    assert(loginRes.status === 200, "Login returns HTTP 200");
+    const setCookieHeader = loginRes.headers.get("set-cookie") || "";
+    assert(setCookieHeader.includes("nueways_session="), "Login response sets 'nueways_session' cookie");
+    assert(setCookieHeader.toLowerCase().includes("httponly"), "Session cookie includes 'HttpOnly' flag");
+    assert(setCookieHeader.includes("Max-Age=604800") || setCookieHeader.includes("Expires="), "Session cookie includes 7-day Max-Age / Expires");
+    assert(setCookieHeader.toLowerCase().includes("samesite=lax"), "Session cookie sets 'SameSite=Lax'");
+
+    // Extract cookie value
+    const match = setCookieHeader.match(/nueways_session=([^;]+)/);
+    const sessionCookieValue = match ? match[1] : "";
+    assert(sessionCookieValue.length > 0, "Extracted valid session cookie value");
+
+    // 6.2: GET /auth/me restores valid session from HttpOnly cookie
+    const meRes = await fetch(`${baseUrl}/api/v1/auth/me`, {
+      method: "GET",
+      headers: {
+        Cookie: `nueways_session=${sessionCookieValue}`,
+      },
+    });
+    const meBody = (await meRes.json()) as any;
+    assert(meRes.status === 200, "GET /auth/me returns 200 with valid session cookie");
+    assert(meBody.success === true, "GET /auth/me response envelope indicates success");
+    assert(meBody.data?.user?.email === activeSalesUser.email, "GET /auth/me returns authenticated user email");
+    assert(meBody.data?.user?.role === "SALES", "GET /auth/me restores exact SALES role");
+
+    // 6.3: GET /auth/me without cookie or header returns 401
+    const unauthMeRes = await fetch(`${baseUrl}/api/v1/auth/me`, {
+      method: "GET",
+    });
+    assert(unauthMeRes.status === 401, "GET /auth/me rejects unauthenticated request (HTTP 401)");
+
+    // 6.4: GET /auth/me with invalid/tampered cookie returns 401
+    const tamperedMeRes = await fetch(`${baseUrl}/api/v1/auth/me`, {
+      method: "GET",
+      headers: {
+        Cookie: "nueways_session=invalid.tampered.token",
+      },
+    });
+    assert(tamperedMeRes.status === 401, "GET /auth/me rejects tampered cookie (HTTP 401)");
+
+    // 6.5: Role preservation for ADMIN via cookie
+    const adminUser = createMockUser({
+      name: "Super Admin",
+      email: "admin@neuways.com",
+      role: "ADMIN",
+      isActive: true,
+    });
+    const adminToken = authService.generateToken({
+      id: adminUser.id,
+      email: adminUser.email,
+      role: "ADMIN",
+    });
+
+    User.findById = ((id: any) => {
+      if (id.toString() === adminUser.id) {
+        return { select: () => Promise.resolve(adminUser) };
+      }
+      return { select: () => Promise.resolve(null) };
+    }) as any;
+
+    const adminMeRes = await fetch(`${baseUrl}/api/v1/auth/me`, {
+      method: "GET",
+      headers: {
+        Cookie: `nueways_session=${adminToken}`,
+      },
+    });
+    const adminMeBody = (await adminMeRes.json()) as any;
+    assert(adminMeRes.status === 200, "Admin session restored via cookie");
+    assert(adminMeBody.data?.user?.role === "ADMIN", "Admin role strictly preserved during session restoration");
+
+    // 6.6: CSRF protection on mutating cookie-authenticated request
+    // Foreign/untrusted origin rejected
+    const csrfBlockedRes = await fetch(`${baseUrl}/api/v1/enquiries`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: `nueways_session=${sessionCookieValue}`,
+        Origin: "http://malicious-attacker.com",
+      },
+      body: JSON.stringify({ name: "CSRF lead", mobile: "9999999999" }),
+    });
+    assert(csrfBlockedRes.status === 403, "Mutating cookie request from untrusted origin blocked by CSRF protection (HTTP 403)");
+
+    // Allowed origin accepted
+    User.findById = ((id: any) => {
+      if (id.toString() === activeSalesUser.id) {
+        return { select: () => Promise.resolve(activeSalesUser) };
+      }
+      return { select: () => Promise.resolve(null) };
+    }) as any;
+
+    const csrfAllowedRes = await fetch(`${baseUrl}/api/v1/enquiries`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: `nueways_session=${sessionCookieValue}`,
+        Origin: "http://localhost:5173",
+      },
+      body: JSON.stringify({ name: "Safe lead", mobile: "9999999999" }),
+    });
+    assert(csrfAllowedRes.status === 201, "Mutating cookie request from allowed origin accepted (HTTP 201)");
+
+    // 6.7: POST /auth/logout clears cookie
+    const logoutRes = await fetch(`${baseUrl}/api/v1/auth/logout`, {
+      method: "POST",
+      headers: {
+        Cookie: `nueways_session=${sessionCookieValue}`,
+      },
+    });
+    assert(logoutRes.status === 200, "POST /auth/logout returns HTTP 200");
+    const logoutCookieHeader = logoutRes.headers.get("set-cookie") || "";
+    assert(
+      logoutCookieHeader.includes("nueways_session=;") ||
+      logoutCookieHeader.includes("Max-Age=0") ||
+      logoutCookieHeader.includes("Expires=Thu, 01 Jan 1970"),
+      "POST /auth/logout clears 'nueways_session' cookie with zero max-age/expiration",
+    );
+
     // Restore mocks
     User.findById = originalFindById;
+    User.findOne = originalFindOne;
     enquiryService.createEnquiry = originalCreateEnquiry;
   } finally {
     if (server) {

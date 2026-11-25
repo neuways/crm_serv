@@ -1,6 +1,12 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
-import { AuthService, authService } from '../services/auth.service.js';
+import {
+  AuthService,
+  authService,
+  AUTH_COOKIE_NAME,
+  getAuthCookieOptions,
+  getClearCookieOptions
+} from '../services/auth.service.js';
 import { sanitizeErrorMessage } from '../config/db.js';
 
 export const loginSchema = z.object({
@@ -50,6 +56,8 @@ export class AuthController {
       }
 
       const result = await this.service.login(parseResult.data);
+
+      res.cookie(AUTH_COOKIE_NAME, result.token, getAuthCookieOptions());
 
       return res.status(200).json({
         success: true,
@@ -101,6 +109,8 @@ export class AuthController {
       }
 
       const result = await this.service.loginWithGoogle(parseResult.data);
+
+      res.cookie(AUTH_COOKIE_NAME, result.token, getAuthCookieOptions());
 
       return res.status(200).json({
         success: true,
@@ -197,6 +207,40 @@ export class AuthController {
         message: 'An unexpected error occurred while changing password.'
       });
     }
+  };
+
+  /**
+   * HTTP GET handler for retrieving and restoring current authenticated user session (/auth/me).
+   * Requires valid Bearer token or persistent HttpOnly session cookie.
+   */
+  getCurrentUser = async (req: Request, res: Response): Promise<Response> => {
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required.'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Session verified.',
+      data: {
+        user: req.user
+      }
+    });
+  };
+
+  /**
+   * HTTP POST handler for voluntary user logout (/auth/logout).
+   * Clears the persistent HttpOnly session cookie.
+   */
+  logout = async (_req: Request, res: Response): Promise<Response> => {
+    res.clearCookie(AUTH_COOKIE_NAME, getClearCookieOptions());
+    return res.status(200).json({
+      success: true,
+      message: 'Logged out successfully.'
+    });
   };
 }
 
