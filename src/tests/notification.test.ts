@@ -911,6 +911,7 @@ async function runAllTests() {
     targetLeadId,
     {
       step: 'FOLLOW_UP',
+      outcome: 'MEETING_SCHEDULED',
       notes: 'Customer discussed floor plan requirements',
       advanceStage: true
     },
@@ -947,6 +948,7 @@ async function runAllTests() {
     enqMgrAdvanceId.toString(),
     {
       step: 'FOLLOW_UP',
+      outcome: 'MEETING_SCHEDULED',
       notes: 'Manager approved customer discussion progression',
       advanceStage: true
     },
@@ -2206,6 +2208,7 @@ async function runAllTests() {
     {
       step: 'FOLLOW_UP',
       purpose: 'CALL',
+      outcome: 'MEETING_SCHEDULED',
       notes: 'Initial discussion finished, client wants meeting',
       advanceStage: true
     },

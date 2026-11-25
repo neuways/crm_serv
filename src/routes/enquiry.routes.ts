@@ -60,6 +60,30 @@ enquiryRouter.get(
   enquiryController.getTeam
 );
 
+// GET /api/v1/enquiries/team-activity-report - Protected: Retrieve employee daily work & call accountability metrics
+enquiryRouter.get(
+  '/team-activity-report',
+  requireAuth,
+  requireRole('ADMIN', 'MANAGER', 'SALES'),
+  enquiryController.getTeamActivityReport
+);
+
+// GET /api/v1/enquiries/activity-feed - Protected: Retrieve role-scoped cross-lead chronological activity stream
+enquiryRouter.get(
+  '/activity-feed',
+  requireAuth,
+  requireRole('ADMIN', 'MANAGER', 'SALES'),
+  enquiryController.getActivityFeed
+);
+
+// POST /api/v1/enquiries/work-report/submit - Protected: Submit daily work report upward (Sales -> Manager + Admin, Manager -> Admin)
+enquiryRouter.post(
+  '/work-report/submit',
+  requireAuth,
+  requireRole('ADMIN', 'MANAGER', 'SALES'),
+  enquiryController.submitWorkReport
+);
+
 // GET /api/v1/enquiries/team/roster - Protected: Retrieve all sales agents with team membership status (ADMIN & MANAGER)
 enquiryRouter.get(
   '/team/roster',
@@ -154,6 +178,14 @@ enquiryRouter.post(
   requireAuth,
   requireRole('ADMIN', 'MANAGER', 'SALES'),
   enquiryController.createFollowUp
+);
+
+// POST /api/v1/enquiries/:id/quick-activity - Protected: 1-click call/interaction outcome logging
+enquiryRouter.post(
+  '/:id/quick-activity',
+  requireAuth,
+  requireRole('ADMIN', 'MANAGER', 'SALES'),
+  enquiryController.logQuickActivity
 );
 
 // GET /api/v1/enquiries/:id/follow-ups - Protected: Authenticated employees can view follow-ups

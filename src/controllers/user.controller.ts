@@ -3,6 +3,17 @@ import { z } from 'zod';
 import { UserService, userService } from '../services/user.service.js';
 import { sanitizeErrorMessage } from '../config/db.js';
 
+import { EMPLOYEE_PHONE_REGEX } from '../models/user.model.js';
+
+const optionalPhoneSchema = z
+  .string()
+  .trim()
+  .refine((val) => val === '' || EMPLOYEE_PHONE_REGEX.test(val), {
+    message: 'Mobile number must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9'
+  })
+  .nullable()
+  .optional();
+
 export const createEmployeeSchema = z.object({
   name: z
     .string({ required_error: 'Full name is required' })
@@ -13,6 +24,7 @@ export const createEmployeeSchema = z.object({
     .string({ required_error: 'Email address is required' })
     .trim()
     .email({ message: 'Invalid email address format' }),
+  phone: optionalPhoneSchema,
   role: z.enum(['MANAGER', 'SALES'], {
     errorMap: () => ({
       message: 'Role must be MANAGER or SALES. Initial ADMIN provisioning requires server CLI.'
@@ -32,6 +44,7 @@ export const updateEmployeeSchema = z.object({
     .min(2, { message: 'Full name must be at least 2 characters long' })
     .max(100, { message: 'Full name cannot exceed 100 characters' })
     .optional(),
+  phone: optionalPhoneSchema,
   role: z.enum(['MANAGER', 'SALES']).optional(),
   managerId: z.string().nullable().optional(),
   temporaryPassword: z

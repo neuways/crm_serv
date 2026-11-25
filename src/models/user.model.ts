@@ -5,6 +5,7 @@ export type UserRole = 'ADMIN' | 'MANAGER' | 'SALES';
 export interface IUser extends Document {
   name: string;
   email: string;
+  phone?: string | null;
   passwordHash: string;
   googleSub?: string;
   role: UserRole;
@@ -16,6 +17,8 @@ export interface IUser extends Document {
   createdAt: Date;
   updatedAt: Date;
 }
+
+export const EMPLOYEE_PHONE_REGEX = /^[6-9]\d{9}$/;
 
 const userSchema = new Schema<IUser>(
   {
@@ -30,6 +33,18 @@ const userSchema = new Schema<IUser>(
       unique: true,
       lowercase: true,
       trim: true
+    },
+    phone: {
+      type: String,
+      trim: true,
+      default: null,
+      validate: {
+        validator: (value: string | null | undefined) => {
+          if (!value) return true;
+          return EMPLOYEE_PHONE_REGEX.test(value);
+        },
+        message: 'Mobile number must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9'
+      }
     },
     passwordHash: {
       type: String,

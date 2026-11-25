@@ -135,7 +135,7 @@ export const requireAuth = async (
       });
     }
 
-    const user = await User.findById(payload.sub).select('name email role isActive mustChangePassword');
+    const user = await User.findById(payload.sub).select('name email phone role isActive mustChangePassword');
 
     if (!user) {
       return res.status(401).json({
@@ -171,6 +171,7 @@ export const requireAuth = async (
       id: user._id.toString(),
       name: user.name,
       email: user.email,
+      phone: user.phone || null,
       role: user.role,
       mustChangePassword: Boolean(user.mustChangePassword)
     };

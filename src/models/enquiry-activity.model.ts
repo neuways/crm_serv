@@ -2,6 +2,8 @@ import { Schema, model, Document, Types } from 'mongoose';
 
 export type ActivityType =
   | 'REMARK_ADDED'
+  | 'CALL_ATTEMPT'
+  | 'WORK_REPORT_SUBMITTED'
   | 'ASSIGNMENT_CHANGED'
   | 'STATUS_CHANGED'
   | 'DUPLICATE_MATCH_DETECTED'
@@ -31,11 +33,18 @@ export class AppendOnlyViolationError extends Error {
 }
 
 export interface IEnquiryActivity extends Document {
-  enquiryId: Types.ObjectId;
+  enquiryId?: Types.ObjectId | null;
   createdById?: Types.ObjectId | null;
   createdByName?: string;
   performedBy?: Types.ObjectId | null;
   performedByName?: string;
+  actorRole?: 'ADMIN' | 'MANAGER' | 'SALES' | 'SYSTEM';
+  managerId?: Types.ObjectId | null;
+  outcome?: string;
+  purpose?: string;
+  callDurationSeconds?: number;
+  nextFollowUpDate?: Date;
+  nextFollowUpTime?: string;
   type: ActivityType;
   note: string;
   metadata?: Record<string, unknown>;
@@ -47,7 +56,13 @@ const enquiryActivitySchema = new Schema<IEnquiryActivity>(
     enquiryId: {
       type: Schema.Types.ObjectId,
       ref: 'Enquiry',
-      required: [true, 'Activity must be linked to an EnquiryId']
+      default: null,
+      required: [
+        function (this: IEnquiryActivity) {
+          return this.type !== 'WORK_REPORT_SUBMITTED';
+        },
+        'Activity must be linked to an EnquiryId'
+      ]
     },
     createdById: {
       type: Schema.Types.ObjectId,
@@ -67,11 +82,44 @@ const enquiryActivitySchema = new Schema<IEnquiryActivity>(
       type: String,
       trim: true
     },
+    actorRole: {
+      type: String,
+      enum: ['ADMIN', 'MANAGER', 'SALES', 'SYSTEM'],
+      index: true
+    },
+    managerId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+      index: true
+    },
+    outcome: {
+      type: String,
+      trim: true,
+      index: true
+    },
+    purpose: {
+      type: String,
+      trim: true
+    },
+    callDurationSeconds: {
+      type: Number,
+      min: 0
+    },
+    nextFollowUpDate: {
+      type: Date
+    },
+    nextFollowUpTime: {
+      type: String,
+      trim: true
+    },
     type: {
       type: String,
       enum: {
         values: [
           'REMARK_ADDED',
+          'CALL_ATTEMPT',
+          'WORK_REPORT_SUBMITTED',
           'ASSIGNMENT_CHANGED',
           'STATUS_CHANGED',
           'DUPLICATE_MATCH_DETECTED',
@@ -262,8 +310,10 @@ enquiryActivitySchema.static(
 // ---------------------------------------------------------------------------------
 enquiryActivitySchema.index({ enquiryId: 1, createdAt: -1 });
 enquiryActivitySchema.index({ createdById: 1 });
-enquiryActivitySchema.index({ performedBy: 1 });
+enquiryActivitySchema.index({ performedBy: 1, createdAt: -1 });
+enquiryActivitySchema.index({ managerId: 1, createdAt: -1 });
 enquiryActivitySchema.index({ type: 1 });
+enquiryActivitySchema.index({ createdAt: -1, outcome: 1 });
 
 export const EnquiryActivity = model<IEnquiryActivity>(
   'EnquiryActivity',

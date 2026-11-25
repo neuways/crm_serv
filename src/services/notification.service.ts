@@ -34,7 +34,9 @@ export type CrmEventType =
   | 'LEAD_REJECTED'
   | 'DEAL_LOST'
   | 'UNASSIGNED_LEAD'
-  | 'RE_ENQUIRY';
+  | 'RE_ENQUIRY'
+  | 'HIERARCHICAL_ACTIVITY'
+  | 'WORK_REPORT_SUBMITTED';
 
 export interface CrmNotificationEvent {
   eventType: CrmEventType;
@@ -328,18 +330,65 @@ export class NotificationService {
   }
 
   /**
+   * Resolves supervisor + Admin notification recipients following the reporting hierarchy:
+   * - SALES -> assigned active MANAGER + all active ADMIN users
+   * - MANAGER -> all active ADMIN users
+   * - ADMIN -> other active ADMIN users (optional)
+   */
+  private async resolveHierarchicalRecipients(
+    actor: { id: string; role: string },
+    enquiry?: { managerId?: any; [key: string]: any } | null,
+    includeAdminsOnAdminActor = true
+  ): Promise<string[]> {
+    const recipientIds = new Set<string>();
+    if (!(mongoose.connection.readyState === 1 || (User as any)._isMocked)) {
+      return [];
+    }
+
+    if (actor.role === 'SALES') {
+      try {
+        const actorUser = await User.findById(actor.id).select('_id managerId isActive');
+        const mgrIdStr = actorUser?.managerId
+          ? (actorUser.managerId._id || actorUser.managerId).toString()
+          : enquiry?.managerId
+          ? (enquiry.managerId._id || enquiry.managerId).toString()
+          : null;
+        if (mgrIdStr && mgrIdStr !== actor.id) {
+          const mgr = await User.findById(mgrIdStr).select('_id role isActive');
+          if (mgr && mgr.role === 'MANAGER' && mgr.isActive) {
+            recipientIds.add(mgr._id.toString());
+          }
+        }
+      } catch {
+        // Ignore lookup error in limited test stubs
+      }
+      const activeAdminIds = await this.getActiveAdminIds();
+      for (const admId of activeAdminIds) recipientIds.add(admId);
+    } else if (actor.role === 'MANAGER') {
+      const activeAdminIds = await this.getActiveAdminIds();
+      for (const admId of activeAdminIds) recipientIds.add(admId);
+    } else if (includeAdminsOnAdminActor) {
+      const activeAdminIds = await this.getActiveAdminIds(actor.id);
+      for (const admId of activeAdminIds) recipientIds.add(admId);
+    }
+
+    recipientIds.delete(actor.id);
+    return Array.from(recipientIds);
+  }
+
+  /**
    * Centralized global CRM event dispatcher for all approved CRM lifecycle events.
    * Isolates notification dispatch so that notification failures never abort or roll back core CRM transactions.
    */
   async dispatchCrmEvent(event: CrmNotificationEvent): Promise<void> {
     try {
       const { eventType, actor, enquiry, payload = {} } = event;
-      if (!enquiry || !enquiry._id) return;
+      if (eventType !== 'WORK_REPORT_SUBMITTED' && (!enquiry || !enquiry._id)) return;
 
-      const enquiryId = enquiry._id.toString();
-      const customerName = enquiry.name || payload.customerName || 'Lead';
-      const projectName = enquiry.projectName || payload.projectName || 'General';
-      const stage = enquiry.currentStage || payload.currentStage || 'FOLLOW_UP';
+      const enquiryId = enquiry?._id ? enquiry._id.toString() : '';
+      const customerName = enquiry?.name || payload.customerName || 'Lead';
+      const projectName = enquiry?.projectName || payload.projectName || 'General';
+      const stage = enquiry?.currentStage || payload.currentStage || 'FOLLOW_UP';
 
       switch (eventType) {
         case 'LEAD_REASSIGNED': {
@@ -728,13 +777,21 @@ export class NotificationService {
             }
             if (teamMgrIdStr) {
               const teamMgr = await User.findById(teamMgrIdStr).select('_id role isActive');
-              if (teamMgr && teamMgr.role === 'MANAGER' && teamMgr.isActive) {
+              if (teamMgr && (teamMgr.role === 'MANAGER' || teamMgr.role === 'ADMIN') && teamMgr.isActive) {
                 managerIdToNotify = teamMgr._id.toString();
               }
             }
           }
 
-          if (managerIdToNotify && managerIdToNotify !== enquiry.assignedTo?.toString()) {
+          // 3. Active Admins
+          const activeAdminIds = await this.getActiveAdminIds(actor.role === 'ADMIN' ? actor.id : undefined);
+          const activeAdminSet = new Set(activeAdminIds);
+
+          if (
+            managerIdToNotify &&
+            managerIdToNotify !== enquiry.assignedTo?.toString() &&
+            !activeAdminSet.has(managerIdToNotify)
+          ) {
             notifications.push({
               recipient: managerIdToNotify,
               sender: actor.id,
@@ -751,8 +808,6 @@ export class NotificationService {
             });
           }
 
-          // 3. Active Admins
-          const activeAdminIds = await this.getActiveAdminIds(actor.role === 'ADMIN' ? actor.id : undefined);
           for (const admId of activeAdminIds) {
             notifications.push({
               recipient: admId,
@@ -842,13 +897,21 @@ export class NotificationService {
             }
             if (teamMgrIdStr) {
               const teamMgr = await User.findById(teamMgrIdStr).select('_id role isActive');
-              if (teamMgr && teamMgr.role === 'MANAGER' && teamMgr.isActive) {
+              if (teamMgr && (teamMgr.role === 'MANAGER' || teamMgr.role === 'ADMIN') && teamMgr.isActive) {
                 managerIdToNotify = teamMgr._id.toString();
               }
             }
           }
 
-          if (managerIdToNotify && managerIdToNotify !== enquiry.assignedTo?.toString()) {
+          // 3. Active Admins
+          const activeAdminIds = await this.getActiveAdminIds(actor.role === 'ADMIN' ? actor.id : undefined);
+          const activeAdminSet = new Set(activeAdminIds);
+
+          if (
+            managerIdToNotify &&
+            managerIdToNotify !== enquiry.assignedTo?.toString() &&
+            !activeAdminSet.has(managerIdToNotify)
+          ) {
             notifications.push({
               recipient: managerIdToNotify,
               sender: actor.id,
@@ -865,8 +928,6 @@ export class NotificationService {
             });
           }
 
-          // 3. Active Admins
-          const activeAdminIds = await this.getActiveAdminIds(actor.role === 'ADMIN' ? actor.id : undefined);
           for (const admId of activeAdminIds) {
             notifications.push({
               recipient: admId,
@@ -1362,6 +1423,92 @@ export class NotificationService {
             link: `/sales/leads/${enquiryId}/workflow`,
             idempotencyKey: `re_enquiry_${enquiryId}_${recId}`,
             metadata
+          }));
+
+          await Promise.allSettled(notifications.map((n) => this.createNotification(n)));
+          break;
+        }
+
+        case 'HIERARCHICAL_ACTIVITY': {
+          const {
+            activityId = Date.now().toString(),
+            outcome = '',
+            outcomeLabel = '',
+            purpose = 'CALL',
+            note = '',
+            callDurationSeconds
+          } = payload;
+          const actorRoleLabel =
+            actor.role === 'SALES' ? 'Sales Agent' : actor.role === 'MANAGER' ? 'Manager' : 'Admin';
+          const recipientIds = await this.resolveHierarchicalRecipients(actor, enquiry, true);
+
+          const readableOutcome = outcomeLabel || outcome || 'Follow-up Update';
+          const cleanSnippet = note ? ` Note: "${String(note).trim().slice(0, 140)}"` : '';
+          const notifications = recipientIds.map((recipientId) => ({
+            recipient: recipientId,
+            sender: actor.id,
+            senderName: actor.name,
+            type: 'NEW_ACTIVITY' as const,
+            title: `${readableOutcome}: ${customerName}`,
+            message: `${actor.name} (${actorRoleLabel}) logged ${readableOutcome} via ${purpose} for "${customerName}".${cleanSnippet}`,
+            relatedEnquiryId: enquiryId,
+            relatedCustomerName: customerName,
+            relatedStage: stage,
+            link: `/sales/leads/${enquiryId}/workflow`,
+            idempotencyKey: `hier_act_${enquiryId}_${recipientId}_${activityId}`,
+            metadata: {
+              leadId: enquiryId,
+              customerName,
+              projectName,
+              eventType: 'HIERARCHICAL_ACTIVITY',
+              outcome,
+              outcomeLabel: readableOutcome,
+              purpose,
+              callDurationSeconds,
+              actorId: actor.id,
+              actorName: actor.name,
+              actorRole: actor.role,
+              timestamp: new Date().toISOString()
+            }
+          }));
+
+          await Promise.allSettled(notifications.map((n) => this.createNotification(n)));
+          break;
+        }
+
+        case 'WORK_REPORT_SUBMITTED': {
+          const {
+            activityId = Date.now().toString(),
+            summaryNotes = '',
+            statsSummary = '',
+            period = 'today'
+          } = payload;
+          const actorRoleLabel =
+            actor.role === 'SALES' ? 'Sales Agent' : actor.role === 'MANAGER' ? 'Manager' : 'Admin';
+          const recipientIds = await this.resolveHierarchicalRecipients(actor, null, false);
+
+          const remarksSnippet = summaryNotes ? ` Notes: "${String(summaryNotes).trim().slice(0, 140)}"` : '';
+          const notifications = recipientIds.map((recipientId) => ({
+            recipient: recipientId,
+            sender: actor.id,
+            senderName: actor.name,
+            type: 'WORKFLOW_UPDATE' as const,
+            title: `Daily Work Summary: ${actor.name} (${actorRoleLabel})`,
+            message: `${actor.name} (${actorRoleLabel}) submitted a ${period} work report${statsSummary ? ` (${statsSummary})` : ''}.${remarksSnippet}`,
+            relatedEnquiryId: null,
+            relatedCustomerName: null,
+            relatedStage: null,
+            link: `/activities?employeeId=${actor.id}`,
+            idempotencyKey: `work_report_${actor.id}_${recipientId}_${activityId}`,
+            metadata: {
+              eventType: 'WORK_REPORT_SUBMITTED',
+              actorId: actor.id,
+              actorName: actor.name,
+              actorRole: actor.role,
+              period,
+              statsSummary,
+              timestamp: new Date().toISOString()
+            }
           }));
 
           await Promise.allSettled(notifications.map((n) => this.createNotification(n)));

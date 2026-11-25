@@ -150,6 +150,7 @@ export class AuthService {
       id: user._id.toString(),
       name: user.name,
       email: user.email,
+      phone: user.phone || null,
       role: user.role,
       mustChangePassword: Boolean(user.mustChangePassword)
     };
@@ -293,6 +294,7 @@ export class AuthService {
       id: user._id.toString(),
       name: user.name,
       email: user.email,
+      phone: user.phone || null,
       role: user.role,
       mustChangePassword: Boolean(user.mustChangePassword)
     };

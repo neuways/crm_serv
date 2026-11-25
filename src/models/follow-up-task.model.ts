@@ -2,7 +2,16 @@ import { Schema, model, Document, Types } from 'mongoose';
 
 export type TaskPurpose = 'CALL' | 'WHATSAPP' | 'EMAIL' | 'MEETING' | 'SITE_VISIT' | 'OTHER';
 export type TaskStatus = 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED' | 'RESCHEDULED';
-export type TaskOutcome = 'CONNECTED' | 'NO_ANSWER' | 'CALL_BACK_REQUESTED' | 'MEETING_SCHEDULED' | 'NOT_INTERESTED' | 'OTHER';
+export type TaskOutcome =
+  | 'CONNECTED'
+  | 'NO_ANSWER'
+  | 'SWITCHED_OFF'
+  | 'CALL_BACK_REQUESTED'
+  | 'MEETING_SCHEDULED'
+  | 'SITE_VISIT_COMPLETED'
+  | 'DEAL_DONE'
+  | 'NOT_INTERESTED'
+  | 'OTHER';
 
 export const ALLOWED_STATUS_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   PENDING: ['IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'RESCHEDULED'],
@@ -123,7 +132,17 @@ const followUpTaskSchema = new Schema<IFollowUpTask>(
     outcome: {
       type: String,
       enum: {
-        values: ['CONNECTED', 'NO_ANSWER', 'CALL_BACK_REQUESTED', 'MEETING_SCHEDULED', 'NOT_INTERESTED', 'OTHER'],
+        values: [
+          'CONNECTED',
+          'NO_ANSWER',
+          'SWITCHED_OFF',
+          'CALL_BACK_REQUESTED',
+          'MEETING_SCHEDULED',
+          'SITE_VISIT_COMPLETED',
+          'DEAL_DONE',
+          'NOT_INTERESTED',
+          'OTHER'
+        ],
         message: '{VALUE} is not a valid follow-up outcome'
       },
       default: 'CONNECTED'

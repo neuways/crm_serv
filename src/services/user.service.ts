@@ -1,5 +1,5 @@
 import mongoose, { Types } from 'mongoose';
-import { User, IUser } from '../models/user.model.js';
+import { User, IUser, UserRole, EMPLOYEE_PHONE_REGEX } from '../models/user.model.js';
 import { PropertyMapping } from '../models/property-mapping.model.js';
 import { Enquiry } from '../models/enquiry.model.js';
 import { EnquiryActivity } from '../models/enquiry-activity.model.js';
@@ -11,13 +11,99 @@ import { CreateEmployeeInput, UpdateEmployeeInput, SafeEmployeeData, UpdateEmplo
 import { sanitizeErrorMessage, withOptionalTransaction } from '../config/db.js';
 
 export class UserService {
+  private parseAndValidatePhone(phone: string | null | undefined): string | null {
+    if (phone === null || phone === undefined) {
+      return null;
+    }
+
+    const trimmed = String(phone).trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    if (!EMPLOYEE_PHONE_REGEX.test(trimmed)) {
+      const err = new Error(
+        'Mobile number must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9.'
+      );
+      (err as any).statusCode = 400;
+      throw err;
+    }
+
+    return trimmed;
+  }
+
+  private async findSupervisorById(supervisorId: string): Promise<IUser | null> {
+    let supervisor = await User.findOne({ _id: supervisorId, role: 'MANAGER' });
+    if (!supervisor) {
+      supervisor = await User.findOne({ _id: supervisorId, role: 'ADMIN' });
+    }
+    if (!supervisor) {
+      const candidate = await User.findById(supervisorId);
+      if (candidate && (candidate.role === 'MANAGER' || candidate.role === 'ADMIN')) {
+        supervisor = candidate;
+      }
+    }
+    return supervisor;
+  }
+
+  private async resolveSalesSupervisor(
+    requestedManagerId: string | null | undefined,
+    actor: AuthUser
+  ): Promise<{ managerId: Types.ObjectId | null; managerName: string | null; managerRole: UserRole | null }> {
+    const trimmedManagerId = typeof requestedManagerId === 'string' ? requestedManagerId.trim() : '';
+
+    if (trimmedManagerId) {
+      if (!Types.ObjectId.isValid(trimmedManagerId)) {
+        const err = new Error('Invalid Manager ID format.');
+        (err as any).statusCode = 400;
+        throw err;
+      }
+
+      const supervisor = await this.findSupervisorById(trimmedManagerId);
+      if (!supervisor) {
+        const err = new Error('Assigned Manager or Admin not found.');
+        (err as any).statusCode = 404;
+        throw err;
+      }
+
+      return {
+        managerId: supervisor._id as Types.ObjectId,
+        managerName: supervisor.name,
+        managerRole: supervisor.role
+      };
+    }
+
+    // Default to Direct Admin oversight (creating/updating ADMIN's ID) when managerId is empty/null
+    if (actor.role === 'ADMIN' && actor.id && Types.ObjectId.isValid(actor.id)) {
+      const adminDoc = await User.findById(actor.id);
+      if (adminDoc) {
+        return {
+          managerId: adminDoc._id as Types.ObjectId,
+          managerName: adminDoc.name,
+          managerRole: adminDoc.role
+        };
+      }
+      return {
+        managerId: new Types.ObjectId(actor.id),
+        managerName: actor.name || 'Admin',
+        managerRole: 'ADMIN'
+      };
+    }
+
+    return {
+      managerId: null,
+      managerName: null,
+      managerRole: null
+    };
+  }
+
   /**
    * Retrieves all registered employees excluding sensitive authentication secrets.
    * Excludes passwordHash and googleSub.
    */
   async listEmployees(): Promise<SafeEmployeeData[]> {
     const query: any = User.find()
-      .select('name email role isActive mustChangePassword googleSub managerId assignedPropertyIds createdAt updatedAt');
+      .select('name email phone role isActive mustChangePassword googleSub managerId assignedPropertyIds createdAt updatedAt');
 
     if (typeof query.populate === 'function') {
       query.populate('managerId', 'name email role');
@@ -54,12 +140,14 @@ export class UserService {
         id: u._id.toString(),
         name: u.name,
         email: u.email,
+        phone: u.phone || null,
         role: u.role,
         isActive: u.isActive,
         mustChangePassword: Boolean(u.mustChangePassword),
         hasGoogleLinked: Boolean(u.googleSub),
         managerId: u.managerId?._id ? u.managerId._id.toString() : u.managerId ? u.managerId.toString() : null,
         managerName: u.managerId?.name || null,
+        managerRole: u.managerId?.role || null,
         assignedPropertyIds,
         assignedProperties,
         createdAt: u.createdAt,
@@ -103,6 +191,8 @@ export class UserService {
       throw err;
     }
 
+    const validatedPhone = this.parseAndValidatePhone(input.phone);
+
     if (!input.temporaryPassword || input.temporaryPassword.length < 8) {
       const err = new Error('Temporary password must be at least 8 characters long.');
       (err as any).statusCode = 400;
@@ -119,14 +209,12 @@ export class UserService {
 
     let validatedManagerId: Types.ObjectId | null = null;
     let managerNameStr: string | null = null;
-    if (input.managerId && input.role === 'SALES') {
-      if (Types.ObjectId.isValid(input.managerId)) {
-        const mgr = await User.findOne({ _id: input.managerId, role: 'MANAGER' });
-        if (mgr) {
-          validatedManagerId = mgr._id as Types.ObjectId;
-          managerNameStr = mgr.name;
-        }
-      }
+    let managerRole: UserRole | null = null;
+    if (input.role === 'SALES') {
+      const resolvedSupervisor = await this.resolveSalesSupervisor(input.managerId, actor);
+      validatedManagerId = resolvedSupervisor.managerId;
+      managerNameStr = resolvedSupervisor.managerName;
+      managerRole = resolvedSupervisor.managerRole;
     }
 
     // Validate assigned properties for SALES role
@@ -158,6 +246,7 @@ export class UserService {
     const newEmployee = new User({
       name: trimmedName,
       email: normalized,
+      phone: validatedPhone,
       passwordHash,
       role: input.role,
       isActive: true,
@@ -184,12 +273,14 @@ export class UserService {
       id: newEmployee._id.toString(),
       name: newEmployee.name,
       email: newEmployee.email,
+      phone: newEmployee.phone || null,
       role: newEmployee.role,
       isActive: newEmployee.isActive,
       mustChangePassword: true,
       hasGoogleLinked: false,
       managerId: validatedManagerId ? validatedManagerId.toString() : null,
       managerName: managerNameStr,
+      managerRole,
       assignedPropertyIds,
       assignedProperties,
       createdAt: newEmployee.createdAt,
@@ -242,6 +333,10 @@ export class UserService {
       user.name = trimmed;
     }
 
+    if (input.phone !== undefined) {
+      user.phone = this.parseAndValidatePhone(input.phone);
+    }
+
     if (input.role !== undefined && user.role !== 'ADMIN') {
       if (input.role !== 'MANAGER' && input.role !== 'SALES') {
         const err = new Error('Role must be MANAGER or SALES.');
@@ -252,27 +347,28 @@ export class UserService {
     }
 
     let managerNameStr: string | null = null;
-    if (input.managerId !== undefined) {
-      if (input.managerId === null || input.managerId === '') {
-        user.managerId = null;
-      } else {
-        if (!Types.ObjectId.isValid(input.managerId)) {
-          const err = new Error('Invalid Manager ID format.');
-          (err as any).statusCode = 400;
-          throw err;
+    let managerRole: UserRole | null = null;
+    if (user.role === 'MANAGER') {
+      user.managerId = null;
+    } else if (user.role === 'SALES') {
+      if (input.managerId !== undefined) {
+        const resolvedSupervisor = await this.resolveSalesSupervisor(input.managerId, actor);
+        user.managerId = resolvedSupervisor.managerId as any;
+        managerNameStr = resolvedSupervisor.managerName;
+        managerRole = resolvedSupervisor.managerRole;
+      } else if (user.managerId) {
+        const mgr = await User.findById(user.managerId).select('name role');
+        if (mgr) {
+          managerNameStr = mgr.name;
+          managerRole = mgr.role || null;
         }
-        const mgr = await User.findOne({ _id: input.managerId, role: 'MANAGER' });
-        if (!mgr) {
-          const err = new Error('Assigned Manager not found.');
-          (err as any).statusCode = 404;
-          throw err;
-        }
-        user.managerId = mgr._id as any;
-        managerNameStr = mgr.name;
       }
     } else if (user.managerId) {
-      const mgr = await User.findById(user.managerId).select('name');
-      if (mgr) managerNameStr = mgr.name;
+      const mgr = await User.findById(user.managerId).select('name role');
+      if (mgr) {
+        managerNameStr = mgr.name;
+        managerRole = mgr.role || null;
+      }
     }
 
     if (input.temporaryPassword !== undefined && input.temporaryPassword.trim() !== '') {
@@ -393,12 +489,14 @@ export class UserService {
       id: user._id.toString(),
       name: user.name,
       email: user.email,
+      phone: user.phone || null,
       role: user.role,
       isActive: user.isActive,
       mustChangePassword: Boolean(user.mustChangePassword),
       hasGoogleLinked: Boolean(user.googleSub),
       managerId: user.managerId ? user.managerId.toString() : null,
       managerName: managerNameStr,
+      managerRole,
       assignedPropertyIds,
       assignedProperties,
       createdAt: user.createdAt,
@@ -432,7 +530,7 @@ export class UserService {
 
     const query: any = User.findById(targetUserId);
     if (typeof query?.populate === 'function') {
-      query.populate('managerId', 'name');
+      query.populate('managerId', 'name role');
     }
     const user = await query;
     if (!user) {
@@ -599,12 +697,14 @@ export class UserService {
       id: user._id.toString(),
       name: user.name,
       email: user.email,
+      phone: user.phone || null,
       role: user.role,
       isActive: user.isActive,
       mustChangePassword: Boolean(user.mustChangePassword),
       hasGoogleLinked: Boolean(user.googleSub),
       managerId: user.managerId ? (user.managerId as any)._id?.toString() || (user.managerId as any).toString() : null,
       managerName: (user.managerId as any)?.name || null,
+      managerRole: (user.managerId as any)?.role || null,
       assignedPropertyIds,
       assignedProperties,
       createdAt: user.createdAt,

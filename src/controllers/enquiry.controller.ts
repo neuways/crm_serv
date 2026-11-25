@@ -8,15 +8,29 @@ import { sanitizeErrorMessage } from '../config/db.js';
 /**
  * Zod schema for enquiry assignment payload validation.
  */
-export const assignEnquirySchema = z.object({
-  assignedToId: z
-    .string({ required_error: 'assignedToId is required' })
-    .trim()
-    .min(1, { message: 'assignedToId is required' })
-    .refine((val) => Types.ObjectId.isValid(val), {
-      message: 'assignedToId must be a valid MongoDB ObjectId'
-    })
-});
+export const assignEnquirySchema = z
+  .object({
+    assignedToId: z.string().trim().optional(),
+    assignedTo: z.string().trim().optional(),
+  })
+  .transform((data, ctx) => {
+    const resolvedId = (data.assignedToId || data.assignedTo || '').trim();
+    if (!resolvedId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'assignedToId is required',
+      });
+      return z.NEVER;
+    }
+    if (!Types.ObjectId.isValid(resolvedId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'assignedToId must be a valid MongoDB ObjectId',
+      });
+      return z.NEVER;
+    }
+    return { assignedToId: resolvedId };
+  });
 
 /**
  * Zod schema for adding a remark to an enquiry.
@@ -63,7 +77,7 @@ export const createFollowUpSchema = z
       .max(2000, { message: 'Follow-up notes cannot exceed 2000 characters' }),
     status: z.enum(['PENDING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'RESCHEDULED']).optional(),
     outcome: z
-      .enum(['CONNECTED', 'NO_ANSWER', 'CALL_BACK_REQUESTED', 'MEETING_SCHEDULED', 'NOT_INTERESTED', 'OTHER'], {
+      .enum(['CONNECTED', 'NO_ANSWER', 'SWITCHED_OFF', 'CALL_BACK_REQUESTED', 'MEETING_SCHEDULED', 'SITE_VISIT_COMPLETED', 'DEAL_DONE', 'NOT_INTERESTED', 'OTHER'], {
         errorMap: () => ({ message: 'Invalid follow-up outcome' })
       })
       .optional(),
@@ -576,12 +590,44 @@ export class EnquiryController {
         });
       }
 
-      const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
-      const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+      const rawPage = req.query.page ? parseInt(req.query.page as string, 10) : 1;
+      const rawLimit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+      const page = !isNaN(rawPage) && rawPage > 0 ? rawPage : 1;
+      const limit = !isNaN(rawLimit) && rawLimit > 0 ? rawLimit : 20;
       const status = req.query.status as 'ACTIVE' | 'CLOSED' | undefined;
+      const search = req.query.search as string | undefined;
+      const completedDeals = req.query.completedDeals as string | undefined;
+      const excludeCompletedDeals = req.query.excludeCompletedDeals as string | undefined;
+      const rejected = req.query.rejected as string | undefined;
+      const dealLost = req.query.dealLost as string | undefined;
+      const closureType = req.query.closureType as string | undefined;
+      const unassigned = req.query.unassigned === 'true' ? true : req.query.unassigned === 'false' ? false : undefined;
+      const assignedOnly = req.query.assignedOnly === 'true' ? true : req.query.assignedOnly === 'false' ? false : undefined;
+      const unassignedReason = req.query.unassignedReason as string | undefined;
+      const assignedTo = req.query.assignedTo as string | undefined;
+      const excludeAssignedTo = req.query.excludeAssignedTo as string | undefined;
+      const managerId = req.query.managerId as string | undefined;
+      const project = req.query.project as string | undefined;
 
       const result = await this.service.listEnquiries(
-        { page, limit, status },
+        {
+          page,
+          limit,
+          status,
+          search,
+          completedDeals,
+          excludeCompletedDeals,
+          rejected,
+          dealLost,
+          closureType,
+          unassigned,
+          assignedOnly,
+          unassignedReason,
+          assignedTo,
+          excludeAssignedTo,
+          managerId,
+          project,
+        },
         req.user
       );
 
@@ -1024,7 +1070,7 @@ export class EnquiryController {
           message: 'Authentication required'
         });
       }
-      const { agentId } = req.body;
+      const { agentId, initialLeadIds } = req.body;
       if (!agentId || !Types.ObjectId.isValid(agentId)) {
         return res.status(400).json({
           success: false,
@@ -1032,7 +1078,14 @@ export class EnquiryController {
           message: 'Valid agent ID is required'
         });
       }
-      const result = await this.service.assignAgentToTeam(req.user, agentId);
+      if (initialLeadIds !== undefined && !Array.isArray(initialLeadIds)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'initialLeadIds must be an array of valid lead IDs'
+        });
+      }
+      const result = await this.service.assignAgentToTeam(req.user, agentId, initialLeadIds);
       if (!result.success) {
         const errorTitle = result.statusCode === 409 ? 'Conflict' : result.statusCode === 403 ? 'Forbidden' : 'Bad Request';
         return res.status(result.statusCode || 400).json({
@@ -1106,7 +1159,11 @@ export class EnquiryController {
           message: 'Authentication required'
         });
       }
-      const { enquiryIds, assignedTo } = req.body;
+      const { enquiryIds, assignedTo, assignedToId, method } = req.body;
+      const targetAgentId = assignedToId || assignedTo;
+      const assignMethod: 'MANUAL' | 'ROUND_ROBIN' =
+        method === 'ROUND_ROBIN' ? 'ROUND_ROBIN' : 'MANUAL';
+
       if (!Array.isArray(enquiryIds) || enquiryIds.length === 0) {
         return res.status(400).json({
           success: false,
@@ -1114,14 +1171,25 @@ export class EnquiryController {
           message: 'Enquiry IDs array cannot be empty'
         });
       }
-      if (!assignedTo || !Types.ObjectId.isValid(assignedTo)) {
+      if (assignMethod === 'MANUAL' && (!targetAgentId || !Types.ObjectId.isValid(targetAgentId))) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Valid assignedTo user ID is required'
         });
       }
-      const result = await this.service.bulkAssignEnquiries(enquiryIds, assignedTo, req.user);
+      if (targetAgentId && !Types.ObjectId.isValid(targetAgentId)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid assignedTo user ID format'
+        });
+      }
+      const result = await this.service.bulkAssignEnquiries(
+        enquiryIds,
+        { assignedToId: targetAgentId, method: assignMethod },
+        req.user
+      );
       if (!result.success) {
         return res.status(result.statusCode || 400).json({
           success: false,
@@ -1751,6 +1819,214 @@ export class EnquiryController {
         success: false,
         error: 'Internal Server Error',
         message: 'An unexpected error occurred while retrieving Do Not Contact status.'
+      });
+    }
+  };
+
+  /**
+   * POST /api/v1/enquiries/:id/quick-activity
+   * Records a 1-click call attempt / interaction outcome and triggers hierarchical reporting.
+   */
+  logQuickActivity = async (req: Request, res: Response): Promise<Response> => {
+    try {
+      const { id: enquiryId } = req.params;
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized',
+          message: 'Authentication required'
+        });
+      }
+
+      if (!enquiryId || !Types.ObjectId.isValid(enquiryId)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid enquiry ID: must be a valid MongoDB ObjectId'
+        });
+      }
+
+      const result = await this.service.logQuickActivity(enquiryId, req.body || {}, req.user);
+      if (!result.success) {
+        const errorTitle =
+          result.statusCode === 404
+            ? 'Not Found'
+            : result.statusCode === 403
+            ? 'Forbidden'
+            : 'Validation Error';
+        return res.status(result.statusCode || 400).json({
+          success: false,
+          error: errorTitle,
+          message: result.message
+        });
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: 'Interaction logged successfully.',
+        data: {
+          enquiry: result.enquiry,
+          activity: result.activity,
+          followUp: result.followUp
+        }
+      });
+    } catch (err: unknown) {
+      console.error('[EnquiryController] logQuickActivity error:', sanitizeErrorMessage(err));
+      return res.status(500).json({
+        success: false,
+        error: 'Internal Server Error',
+        message: 'An unexpected error occurred while logging quick interaction.'
+      });
+    }
+  };
+
+  /**
+   * GET /api/v1/enquiries/team-activity-report
+   * Returns period-scoped employee call & workflow accountability metrics.
+   */
+  getTeamActivityReport = async (req: Request, res: Response): Promise<Response> => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized',
+          message: 'Authentication required'
+        });
+      }
+
+      const result = await this.service.getTeamActivityReport(
+        {
+          period: req.query.period as any,
+          startDate: req.query.startDate as string | undefined,
+          endDate: req.query.endDate as string | undefined,
+          employeeId: req.query.employeeId as string | undefined,
+          managerId: req.query.managerId as string | undefined
+        },
+        req.user
+      );
+
+      if (!result.success) {
+        return res.status(result.statusCode || 400).json({
+          success: false,
+          error: result.statusCode === 403 ? 'Forbidden' : 'Bad Request',
+          message: result.message
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          period: result.period,
+          rangeStart: result.rangeStart,
+          rangeEnd: result.rangeEnd,
+          employees: result.employees || [],
+          managers: result.managers || [],
+          summary: result.summary
+        }
+      });
+    } catch (err: unknown) {
+      console.error('[EnquiryController] getTeamActivityReport error:', sanitizeErrorMessage(err));
+      return res.status(500).json({
+        success: false,
+        error: 'Internal Server Error',
+        message: 'An unexpected error occurred while generating the work accountability report.'
+      });
+    }
+  };
+
+  /**
+   * GET /api/v1/enquiries/activity-feed
+   * Retrieves role-scoped chronological activity stream across employees and leads.
+   */
+  getActivityFeed = async (req: Request, res: Response): Promise<Response> => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized',
+          message: 'Authentication required'
+        });
+      }
+
+      const result = await this.service.getActivityFeed(
+        {
+          period: req.query.period as any,
+          startDate: req.query.startDate as string | undefined,
+          endDate: req.query.endDate as string | undefined,
+          employeeId: req.query.employeeId as string | undefined,
+          managerId: req.query.managerId as string | undefined,
+          outcome: req.query.outcome as string | undefined,
+          activityType: req.query.activityType as string | undefined,
+          enquiryId: req.query.enquiryId as string | undefined,
+          search: req.query.search as string | undefined,
+          page: req.query.page ? parseInt(req.query.page as string, 10) : 1,
+          limit: req.query.limit ? parseInt(req.query.limit as string, 10) : 30
+        },
+        req.user
+      );
+
+      if (!result.success) {
+        return res.status(result.statusCode || 400).json({
+          success: false,
+          error: result.statusCode === 403 ? 'Forbidden' : 'Bad Request',
+          message: result.message
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          activities: result.activities || [],
+          employees: result.employees || [],
+          pagination: result.pagination
+        }
+      });
+    } catch (err: unknown) {
+      console.error('[EnquiryController] getActivityFeed error:', sanitizeErrorMessage(err));
+      return res.status(500).json({
+        success: false,
+        error: 'Internal Server Error',
+        message: 'An unexpected error occurred while retrieving activity feed.'
+      });
+    }
+  };
+
+  /**
+   * POST /api/v1/enquiries/work-report/submit
+   * Submits an explicit daily work report upward (Sales -> Manager + Admin, Manager -> Admin).
+   */
+  submitWorkReport = async (req: Request, res: Response): Promise<Response> => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized',
+          message: 'Authentication required'
+        });
+      }
+
+      const result = await this.service.submitWorkReport(req.body || {}, req.user);
+      if (!result.success) {
+        return res.status(result.statusCode || 400).json({
+          success: false,
+          error: 'Validation Error',
+          message: result.message
+        });
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: result.message,
+        data: {
+          activity: result.activity
+        }
+      });
+    } catch (err: unknown) {
+      console.error('[EnquiryController] submitWorkReport error:', sanitizeErrorMessage(err));
+      return res.status(500).json({
+        success: false,
+        error: 'Internal Server Error',
+        message: 'An unexpected error occurred while submitting daily work report.'
       });
     }
   };

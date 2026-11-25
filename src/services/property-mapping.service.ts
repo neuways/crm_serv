@@ -1,6 +1,7 @@
 import mongoose, { Types } from 'mongoose';
 import { PropertyMapping, IPropertyMapping } from '../models/property-mapping.model.js';
 import { User, IUser } from '../models/user.model.js';
+import { Enquiry } from '../models/enquiry.model.js';
 import { AuthUser } from '../types/auth.types.js';
 
 export interface UpsertPropertyMappingInput {
@@ -18,8 +19,55 @@ export interface RoundRobinResult {
 export class PropertyMappingService {
   /**
    * Retrieves all property mappings with populated agent details.
+   * When connected to a live MongoDB database, also ensures distinct Enquiry project names
+   * exist in PropertyMapping so they appear cleanly in dropdown selectors.
    */
   async listMappings(): Promise<IPropertyMapping[]> {
+    if (mongoose.connection.readyState === 1 && mongoose.connection.db) {
+      try {
+        const [existingMappings, distinctProjects] = await Promise.all([
+          PropertyMapping.find().select('normalizedName').lean(),
+          Enquiry.distinct('projectName', { projectName: { $type: 'string', $ne: '' } }),
+        ]);
+
+        const existingSet = new Set(
+          existingMappings
+            .map((m: any) => String(m?.normalizedName || '').trim().toLowerCase())
+            .filter(Boolean)
+        );
+
+        const missingOps: any[] = [];
+        for (const rawProject of distinctProjects) {
+          const trimmed = typeof rawProject === 'string' ? rawProject.trim() : '';
+          const normalized = trimmed.toLowerCase();
+          if (trimmed && !existingSet.has(normalized)) {
+            existingSet.add(normalized);
+            missingOps.push({
+              updateOne: {
+                filter: { normalizedName: normalized },
+                update: {
+                  $setOnInsert: {
+                    propertyName: trimmed,
+                    normalizedName: normalized,
+                    agentIds: [],
+                    lastAssignedIndex: -1,
+                    lastAssignedAgentId: null,
+                  },
+                },
+                upsert: true,
+              },
+            });
+          }
+        }
+
+        if (missingOps.length > 0) {
+          await PropertyMapping.bulkWrite(missingOps, { ordered: false });
+        }
+      } catch (syncErr) {
+        console.warn('[PropertyMappingService] Enquiry project sync skipped:', syncErr);
+      }
+    }
+
     return PropertyMapping.find()
       .populate('agentIds', 'name email role isActive isTeamActive')
       .populate('lastAssignedAgentId', 'name email role')

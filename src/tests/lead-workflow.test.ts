@@ -229,16 +229,56 @@ async function runLeadWorkflowTests() {
   assert(missingCallbackRes.success === false, 'Requires nextFollowUpDate & Time when outcome is CALL_BACK_REQUESTED');
   assert(missingCallbackRes.statusCode === 400, 'Returns HTTP 400 for missing callback schedule');
 
-  // Valid follow-up with stage advance
+  // Attempting to advance stage without MEETING_SCHEDULED outcome must be rejected (strict Step 1 gate)
+  const blockedAdvanceRes = await service.saveWorkflowStep(
+    leadA._id.toString(),
+    {
+      step: 'FOLLOW_UP',
+      purpose: 'CALL',
+      outcome: 'CALL_BACK_REQUESTED',
+      followUpDate: '2026-10-27',
+      followUpTime: '11:00',
+      nextFollowUpDate: '2026-10-28',
+      nextFollowUpTime: '16:00',
+      notes: 'Client asked to call back tomorrow at 4 PM.',
+      advanceStage: true
+    },
+    salesAgentA
+  );
+  assert(blockedAdvanceRes.success === false, 'Rejects stage advancement to MEETING_PLAN unless outcome is MEETING_SCHEDULED');
+  assert(blockedAdvanceRes.statusCode === 400, 'Returns HTTP 400 for premature stage advancement');
+  assert(leadA.currentStage === 'FOLLOW_UP', 'Lead stays on FOLLOW_UP after blocked advancement');
+
+  // Saving non-meeting outcome without advancing keeps lead on FOLLOW_UP and persists lastFollowUpOutcome
+  const savedOutcomeRes = await service.saveWorkflowStep(
+    leadA._id.toString(),
+    {
+      step: 'FOLLOW_UP',
+      purpose: 'CALL',
+      outcome: 'CALL_BACK_REQUESTED',
+      followUpDate: '2026-10-27',
+      followUpTime: '10:30',
+      nextFollowUpDate: '2026-10-28',
+      nextFollowUpTime: '16:00',
+      notes: 'Client requested callback tomorrow evening.',
+      advanceStage: false
+    },
+    salesAgentA
+  );
+  assert(savedOutcomeRes.success === true, 'Saves CALL_BACK_REQUESTED follow-up without advancing');
+  assert(savedOutcomeRes.enquiry?.currentStage === 'FOLLOW_UP', 'Keeps stage at FOLLOW_UP');
+  assert(savedOutcomeRes.enquiry?.lastFollowUpOutcome === 'CALL_BACK_REQUESTED', 'Persists lastFollowUpOutcome');
+
+  // Valid follow-up with Meeting Agreed (MEETING_SCHEDULED) and stage advance
   const validFollowUpRes = await service.saveWorkflowStep(
     leadA._id.toString(),
     {
       step: 'FOLLOW_UP',
       purpose: 'WHATSAPP',
-      outcome: 'CONNECTED',
+      outcome: 'MEETING_SCHEDULED',
       followUpDate: '2026-10-27',
       followUpTime: '11:00',
-      notes: 'Customer discussed 3BHK high rise options.',
+      notes: 'Customer discussed 3BHK high rise options and agreed for a meeting.',
       enquiryUpdate: {
         requirement: '3 BHK High Rise + Study',
         budgetMax: 1300000
@@ -248,7 +288,8 @@ async function runLeadWorkflowTests() {
     salesAgentA
   );
   assert(validFollowUpRes.success === true, 'Saves follow-up interaction successfully');
-  assert(validFollowUpRes.enquiry?.currentStage === 'MEETING_PLAN', 'Advances stage to MEETING_PLAN');
+  assert(validFollowUpRes.enquiry?.currentStage === 'MEETING_PLAN', 'Advances stage to MEETING_PLAN when Meeting Agreed');
+  assert(validFollowUpRes.enquiry?.lastFollowUpOutcome === 'MEETING_SCHEDULED', 'Updates lastFollowUpOutcome to MEETING_SCHEDULED');
   assert(validFollowUpRes.enquiry?.requirement === '3 BHK High Rise + Study', 'Updates enquiry requirement details');
 
   // -------------------------------------------------------------

@@ -4,6 +4,16 @@ import { normalizeMobile, normalizeEmail } from '../utils/normalization.js';
 export type PreferredContactMethod = 'CALL' | 'WHATSAPP' | 'EMAIL';
 export type EnquiryStatus = 'ACTIVE' | 'CLOSED';
 export type WorkflowStage = 'FOLLOW_UP' | 'MEETING_PLAN' | 'SITE_VISIT_PLAN' | 'DEAL_DONE';
+export type FollowUpOutcome =
+  | 'CONNECTED'
+  | 'NO_ANSWER'
+  | 'SWITCHED_OFF'
+  | 'CALL_BACK_REQUESTED'
+  | 'MEETING_SCHEDULED'
+  | 'SITE_VISIT_COMPLETED'
+  | 'DEAL_DONE'
+  | 'NOT_INTERESTED'
+  | 'OTHER';
 
 export interface ICancellationHistoryItem {
   cancellationReason: string;
@@ -187,10 +197,12 @@ export interface IEnquiry extends Document {
   isReEnquiry?: boolean;
   importId?: string;
   importRowNumber?: number;
-  unassignedReason?: string;
+  unassignedReason?: string | null;
   managerId?: Types.ObjectId | null;
   createdById?: Types.ObjectId | null;
   createdByName?: string;
+  lastFollowUpOutcome?: FollowUpOutcome;
+  lastFollowUpAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -492,7 +504,8 @@ const enquirySchema = new Schema<IEnquiry>(
     },
     unassignedReason: {
       type: String,
-      trim: true
+      trim: true,
+      default: null
     },
     managerId: {
       type: Schema.Types.ObjectId,
@@ -509,6 +522,23 @@ const enquirySchema = new Schema<IEnquiry>(
     createdByName: {
       type: String,
       trim: true
+    },
+    lastFollowUpOutcome: {
+      type: String,
+      enum: [
+        'CONNECTED',
+        'NO_ANSWER',
+        'SWITCHED_OFF',
+        'CALL_BACK_REQUESTED',
+        'MEETING_SCHEDULED',
+        'SITE_VISIT_COMPLETED',
+        'DEAL_DONE',
+        'NOT_INTERESTED',
+        'OTHER'
+      ]
+    },
+    lastFollowUpAt: {
+      type: Date
     }
   },
   {

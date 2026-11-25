@@ -310,7 +310,7 @@ async function main() {
       body: {
         step: 'FOLLOW_UP',
         purpose: 'CALL',
-        outcome: 'CONNECTED',
+        outcome: 'MEETING_SCHEDULED',
         notes: 'Initial client discussion: confirmed 2BHK preference in Whitefield; scheduled meeting.',
         advanceStage: true
       }
