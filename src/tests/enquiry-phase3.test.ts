@@ -359,9 +359,35 @@ async function runPhase3Tests() {
       "Activity records performedByName as Admin Director",
     );
 
-    // 1B: MANAGER reassigns enquiry from Agent 1 to Agent 2 -> HTTP 200, creates reassignment event
-    const assignRes2 = await fetch(
+    // 1B: MANAGER cannot reassign Sales-held lead (HTTP 403), CAN assign Manager-held lead (HTTP 200)
+    const blockedMgrAssignRes = await fetch(
       `${baseUrl}/api/v1/enquiries/${unassignedLead.id}/assign`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${managerToken}`,
+        },
+        body: JSON.stringify({ assignedToId: salesAgent2.id }),
+      },
+    );
+    assert(
+      blockedMgrAssignRes.status === 403,
+      "MANAGER reassignment of a Sales-held lead returns HTTP 403 Forbidden",
+    );
+
+    const managerHeldLead = createMockEnquiry(
+      {
+        name: "Manager Held Lead",
+        status: "ACTIVE",
+        assignedTo: managerUser._id as Types.ObjectId,
+      },
+      usersMap,
+    );
+    enquiriesMap.set(managerHeldLead.id, managerHeldLead);
+
+    const assignRes2 = await fetch(
+      `${baseUrl}/api/v1/enquiries/${managerHeldLead.id}/assign`,
       {
         method: "PATCH",
         headers: {
@@ -375,7 +401,7 @@ async function runPhase3Tests() {
 
     assert(
       assignRes2.status === 200,
-      "MANAGER reassignment returns HTTP 200 OK",
+      "MANAGER assignment of manager-held lead returns HTTP 200 OK",
     );
     assert(
       assignBody2.data.enquiry.assignedTo.name === "Sales Agent Beta",
@@ -384,20 +410,20 @@ async function runPhase3Tests() {
 
     const assignActivity2 = savedActivities.filter(
       (a) =>
-        a.enquiryId.toString() === unassignedLead.id &&
+        a.enquiryId.toString() === managerHeldLead.id &&
         a.type === "ASSIGNMENT_CHANGED",
-    )[1];
+    )[0];
     assert(
       Boolean(assignActivity2),
-      "Creates second ASSIGNMENT_CHANGED event on reassignment",
+      "Creates ASSIGNMENT_CHANGED event on manager-held lead assignment",
     );
     assert(
-      assignActivity2.metadata.previousAssigneeId === salesAgent1.id,
-      "Records previousAssigneeId as Agent Alpha",
+      assignActivity2.metadata.previousAssigneeId === managerUser.id,
+      "Records previousAssigneeId as Manager Lead",
     );
     assert(
-      assignActivity2.metadata.previousAssigneeName === "Sales Agent Alpha",
-      "Records previousAssigneeName as Sales Agent Alpha",
+      assignActivity2.metadata.previousAssigneeName === "Manager Lead",
+      "Records previousAssigneeName as Manager Lead",
     );
     assert(
       assignActivity2.metadata.newAssigneeId === salesAgent2.id,

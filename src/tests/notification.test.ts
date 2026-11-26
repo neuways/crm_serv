@@ -443,19 +443,43 @@ async function runAllTests() {
   pass('Scenario 2: Admin Round Robin assignment notification created with Round Robin metadata and no Admin alert');
 
   // =============================================================
-  // TEST SCENARIO 3: Manager reassignment notification to Sales Agent
+  // TEST SCENARIO 3: Manager reassignment blocked on Sales-held lead & allowed on Manager-held lead
   // =============================================================
-  console.log('\n--- Scenario 3: Manager reassignment notification to Sales Agent ---');
-  const reassignRes = await enquiryService.assignEnquiry(enq1Id.toString(), salesAgent2Id.toString(), managerActor);
-  assert.strictEqual(reassignRes.success, true, 'Manager reassignment succeeded');
+  console.log('\n--- Scenario 3: Manager assignment notification to Sales Agent (Manager-held only) ---');
+  const blockedReassignRes = await enquiryService.assignEnquiry(
+    enq1Id.toString(),
+    salesAgent2Id.toString(),
+    managerActor
+  );
+  assert.strictEqual(blockedReassignRes.success, false, 'Manager cannot reassign lead already held by Sales Agent 1');
+  assert.strictEqual(blockedReassignRes.statusCode, 403, 'Returns 403 Forbidden for Sales-held lead reassignment by Manager');
+
+  const enq3MgrId = new Types.ObjectId();
+  enquiryStore.push({
+    _id: enq3MgrId,
+    name: 'Ananya Verma',
+    mobile: '9876543299',
+    email: 'ananya.mgr@example.com',
+    projectName: 'Sobha Dream Acres',
+    status: 'ACTIVE',
+    isActive: true,
+    currentStage: 'FOLLOW_UP',
+    assignedTo: managerId,
+    managerId,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  });
+
+  const reassignRes = await enquiryService.assignEnquiry(enq3MgrId.toString(), salesAgent2Id.toString(), managerActor);
+  assert.strictEqual(reassignRes.success, true, 'Manager assignment of manager-held lead succeeded');
 
   const ananyaReassignNotifs = notificationStore.filter(
     (n) => n.recipient.toString() === salesAgent2Id.toString() && n.relatedCustomerName === 'Ananya Verma'
   );
-  assert.strictEqual(ananyaReassignNotifs.length, 1, 'Sales Agent 2 received notification for reassigned lead');
+  assert.strictEqual(ananyaReassignNotifs.length, 1, 'Sales Agent 2 received notification for manager-assigned lead');
   assert.strictEqual(ananyaReassignNotifs[0].type, 'LEAD_REASSIGNED');
   assert.strictEqual(ananyaReassignNotifs[0].metadata.assignmentType, 'REASSIGNMENT');
-  assert.strictEqual(ananyaReassignNotifs[0].metadata.previousAssigneeName, 'Rohit Sharma');
+  assert.strictEqual(ananyaReassignNotifs[0].metadata.previousAssigneeName, 'Vikram Malhotra');
   assert.strictEqual(ananyaReassignNotifs[0].metadata.assignedBy, 'Vikram Malhotra');
   assert.strictEqual(ananyaReassignNotifs[0].metadata.assignedByRole, 'MANAGER');
 
@@ -705,13 +729,13 @@ async function runAllTests() {
   // TEST SCENARIO 15: Unauthorized access
   // =============================================================
   console.log('\n--- Scenario 15: Unauthorized access ---');
-  // enq1Id is currently assigned to Agent 2 (from Scenario 3)
-  const agent1AccessAttempt = await enquiryService.getEnquiryById(enq1Id.toString(), salesAgent1);
+  // enq3MgrId is currently assigned to Agent 2 (from Scenario 3)
+  const agent1AccessAttempt = await enquiryService.getEnquiryById(enq3MgrId.toString(), salesAgent1);
   assert.strictEqual(agent1AccessAttempt.success, false);
   assert.strictEqual(agent1AccessAttempt.statusCode, 403, 'Sales Agent 1 accessing Agent 2 lead rejected with 403 Forbidden');
 
   // Sales Agent 2 CAN access their own assigned lead
-  const agent2AccessAttempt = await enquiryService.getEnquiryById(enq1Id.toString(), salesAgent2);
+  const agent2AccessAttempt = await enquiryService.getEnquiryById(enq3MgrId.toString(), salesAgent2);
   assert.strictEqual(agent2AccessAttempt.success, true, 'Assigned Sales Agent 2 can access own lead');
   pass('Scenario 15: Sales Agent attempting to access another agent\'s lead is strictly rejected with 403 Forbidden');
 
@@ -840,8 +864,8 @@ async function runAllTests() {
     isActive: true
   });
 
-  // Target enquiry for workflow actions
-  const targetLeadId = enq1Id.toString();
+  // Target enquiry for workflow actions (enq3MgrId is assigned to salesAgent2 from Scenario 3)
+  const targetLeadId = enq3MgrId.toString();
 
   // -------------------------------------------------------------
   // TEST SCENARIO 19: Sales Agent updates lead status -> all active Admins receive notification
@@ -1457,9 +1481,9 @@ async function runAllTests() {
   }
 
   // -------------------------------------------------------------
-  // TEST SCENARIO 42: Manager reassignment delegating through centralized dispatcher
+  // TEST SCENARIO 42: Manager assignment blocked on Sales-held lead & delegating Manager-held through dispatcher
   // -------------------------------------------------------------
-  console.log('\n--- Scenario 42: Manager reassignment delegation through centralized dispatcher ---');
+  console.log('\n--- Scenario 42: Manager assignment delegation through centralized dispatcher ---');
   const reassignEnq42Id = new Types.ObjectId();
   const reassignLead42: any = {
     _id: reassignEnq42Id,
@@ -1475,21 +1499,45 @@ async function runAllTests() {
   };
   enquiryStore.push(reassignLead42);
 
+  const reassignMgrEnq42Id = new Types.ObjectId();
+  const reassignMgrLead42: any = {
+    _id: reassignMgrEnq42Id,
+    id: reassignMgrEnq42Id.toString(),
+    name: 'Ananya Roy Manager-Held',
+    mobile: '9811223345',
+    status: 'ACTIVE',
+    isActive: true,
+    assignedTo: managerId,
+    managerId,
+    projectName: 'Emerald Heights',
+    currentStage: 'FOLLOW_UP',
+    __v: 1
+  };
+  enquiryStore.push(reassignMgrLead42);
+
   const admin1Before42 = countNotifsFor(adminId);
   const agent2Before42 = countNotifsFor(salesAgent2Id);
   const agent1Before42 = countNotifsFor(salesAgent1Id);
 
-  const reassignRes42 = await enquiryService.assignEnquiry(
+  const blockedRes42 = await enquiryService.assignEnquiry(
     reassignEnq42Id.toString(),
     salesAgent2Id.toString(),
     managerActor
   );
+  assert.strictEqual(blockedRes42.success, false, 'Manager cannot reassign Sales-held lead in Scenario 42');
+  assert.strictEqual(blockedRes42.statusCode, 403, 'Returns 403 Forbidden for Sales-held lead in Scenario 42');
 
-  assert.strictEqual(reassignRes42.success, true, 'Manager reassignment succeeds');
-  assert.strictEqual(countNotifsFor(salesAgent2Id), agent2Before42 + 1, 'Newly assigned Sales Agent 2 receives reassignment notification');
-  assert.strictEqual(countNotifsFor(adminId), admin1Before42 + 1, 'Active Admin 1 receives Manager reassignment notification');
-  assert.strictEqual(countNotifsFor(salesAgent1Id), agent1Before42, 'Previous agent receives zero notifications');
-  pass('Scenario 42: Manager reassignment through centralized dispatcher correctly notifies Sales Agent 2 and active Admins');
+  const reassignRes42 = await enquiryService.assignEnquiry(
+    reassignMgrEnq42Id.toString(),
+    salesAgent2Id.toString(),
+    managerActor
+  );
+
+  assert.strictEqual(reassignRes42.success, true, 'Manager assignment of manager-held lead succeeds');
+  assert.strictEqual(countNotifsFor(salesAgent2Id), agent2Before42 + 1, 'Newly assigned Sales Agent 2 receives assignment notification');
+  assert.strictEqual(countNotifsFor(adminId), admin1Before42 + 1, 'Active Admin 1 receives Manager assignment notification');
+  assert.strictEqual(countNotifsFor(salesAgent1Id), agent1Before42, 'Sales Agent 1 receives zero notifications');
+  pass('Scenario 42: Manager assignment blocks Sales-held leads (403) and notifies Sales Agent 2 and active Admins for Manager-held leads');
 
   // =============================================================
   // SECTION 9: Next Follow-up Scheduled Notifications

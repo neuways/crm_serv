@@ -1392,8 +1392,9 @@ export class EnquiryService {
       };
     }
 
-    // Role-based authorization for reassigning: Managers can only reassign team leads or unassigned leads in their scope
+    // Role-based authorization for reassigning: Managers can only assign unassigned leads in their scope or leads currently assigned to themselves
     if (actor?.role === 'MANAGER') {
+      const actorId = (actor.id || (actor as any)._id || '').toString();
       let currentAssignedToId: string | null = null;
       if (enquiry.assignedTo) {
         const raw = enquiry.assignedTo as any;
@@ -1408,20 +1409,18 @@ export class EnquiryService {
             message: 'Access denied: Managers may only reassign enquiries belonging to their assigned team'
           };
         }
-      } else if (currentAssignedToId !== actor.id) {
-        const isAllowed = await this.isUserInManagerTeam(actor, currentAssignedToId);
-        if (!isAllowed) {
-          return {
-            success: false,
-            statusCode: 403,
-            message: 'Access denied: Managers may only reassign enquiries belonging to their assigned team'
-          };
-        }
+      } else if (currentAssignedToId !== actorId) {
+        return {
+          success: false,
+          statusCode: 403,
+          message:
+            'Managers can only assign unassigned leads or leads assigned to themselves; leads already assigned to a sales agent cannot be reassigned.'
+        };
       }
     }
 
     // 3. Validate that assignee exists, has an allowed role, and is active
-    const assignee = await User.findById(assignedToId).select('name email role isActive managerId');
+    const assignee = await User.findById(assignedToId).select('name email role isActive managerId isTeamActive');
     if (!assignee) {
       return {
         success: false,
@@ -1448,15 +1447,19 @@ export class EnquiryService {
     }
 
     if (actor?.role === 'MANAGER') {
-      if (assignee._id.toString() !== actor.id) {
-        const isAllowed = await this.isUserInManagerTeam(actor, assignee._id.toString());
-        if (!isAllowed) {
-          return {
-            success: false,
-            statusCode: 403,
-            message: 'Access denied: Managers may only assign enquiries to members of their own team'
-          };
-        }
+      const actorId = (actor.id || (actor as any)._id || '').toString();
+      const assigneeManagerRaw = (assignee as any).managerId;
+      const assigneeManagerId = (assigneeManagerRaw?._id || assigneeManagerRaw || '').toString();
+      const isDirectReport =
+        assignee.role === 'SALES' &&
+        (assignee as any).isTeamActive !== false &&
+        (assigneeManagerId === actorId || (await this.isUserInManagerTeam(actor, assignee._id.toString())));
+      if (!isDirectReport) {
+        return {
+          success: false,
+          statusCode: 403,
+          message: 'Access denied: Target assignee must be an active Sales Agent reporting to you'
+        };
       }
     }
 
@@ -6577,7 +6580,9 @@ export class EnquiryService {
     }
 
     if (config.assignedToId) {
-      const targetAgent = await User.findById(config.assignedToId).select('_id name email role managerId isActive');
+      const targetAgent = await User.findById(config.assignedToId).select(
+        '_id name email role managerId isActive isTeamActive'
+      );
       if (!targetAgent || targetAgent.isActive === false) {
         return {
           success: false,
@@ -6588,14 +6593,20 @@ export class EnquiryService {
         };
       }
 
-      // If Manager: verify agent belongs to their own team
+      // If Manager: verify target is an active Sales Agent reporting to them
       if (actor.role === 'MANAGER') {
-        const isTeamMember = await this.isUserInManagerTeam(actor, config.assignedToId);
-        if (!isTeamMember) {
+        const actorId = (actor.id || (actor as any)._id || '').toString();
+        const targetManagerRaw = (targetAgent as any).managerId;
+        const targetManagerId = (targetManagerRaw?._id || targetManagerRaw || '').toString();
+        const isDirectReport =
+          targetAgent.role === 'SALES' &&
+          (targetAgent as any).isTeamActive !== false &&
+          (targetManagerId === actorId || (await this.isUserInManagerTeam(actor, config.assignedToId)));
+        if (!isDirectReport) {
           return {
             success: false,
             statusCode: 403,
-            message: 'Access denied: Managers may only assign leads to agents in their own team',
+            message: 'Access denied: Target assignee must be an active Sales Agent reporting to you',
             assignedCount: 0,
             failedCount: enquiryIds.length
           };
@@ -6618,11 +6629,28 @@ export class EnquiryService {
           continue;
         }
 
-        // If Manager, ensure lead belongs to manager's team if already tagged
-        if (actor.role === 'MANAGER' && enquiry.managerId && enquiry.managerId.toString() !== actor.id) {
-          failedCount++;
-          errors.push({ id: enqId, reason: 'Enquiry belongs to another manager team' });
-          continue;
+        // If Manager, enforce ownership (unassigned or Manager-held) and team scope
+        if (actor.role === 'MANAGER') {
+          const actorId = (actor.id || (actor as any)._id || '').toString();
+          let currentAssignedToId: string | null = null;
+          if (enquiry.assignedTo) {
+            const raw = enquiry.assignedTo as any;
+            currentAssignedToId = (raw._id || raw.id || raw).toString();
+          }
+          if (currentAssignedToId && currentAssignedToId !== actorId) {
+            failedCount++;
+            errors.push({
+              id: enqId,
+              reason:
+                'Managers can only assign unassigned leads or leads assigned to themselves; leads already assigned to a sales agent cannot be reassigned.'
+            });
+            continue;
+          }
+          if (enquiry.managerId && enquiry.managerId.toString() !== actorId) {
+            failedCount++;
+            errors.push({ id: enqId, reason: 'Enquiry belongs to another manager team' });
+            continue;
+          }
         }
 
         let assignedAgentId = config.assignedToId;
@@ -6680,10 +6708,22 @@ export class EnquiryService {
       }
     }
 
+    const forbiddenError = errors.find(
+      (e) =>
+        e.reason.includes('Managers can only assign') ||
+        e.reason.includes('Access denied') ||
+        e.reason.includes('another manager team')
+    );
+    const statusCode = assignedCount > 0 ? 200 : forbiddenError ? 403 : 400;
+    const message =
+      assignedCount === 0 && forbiddenError
+        ? forbiddenError.reason
+        : `Assigned ${assignedCount} of ${enquiryIds.length} lead(s)${failedCount > 0 ? ` (${failedCount} failed)` : ''}`;
+
     return {
       success: assignedCount > 0,
-      statusCode: assignedCount > 0 ? 200 : 400,
-      message: `Assigned ${assignedCount} of ${enquiryIds.length} lead(s)${failedCount > 0 ? ` (${failedCount} failed)` : ''}`,
+      statusCode,
+      message,
       assignedCount,
       failedCount,
       errors: errors.length > 0 ? errors : undefined

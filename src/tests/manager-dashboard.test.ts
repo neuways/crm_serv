@@ -573,18 +573,59 @@ async function runManagerDashboardTests() {
   // ---------------------------------------------------------------------------
   console.log('\n--- Suite 4: Lead Reassignment Permissions ---');
   try {
-    // Vikram can reassign Lead 1 (assigned to Rahul) to Rohit (in Vikram's team)
-    const reassignRes = await enquiryService.assignEnquiry(lead1Id.toString(), agentRohitId.toString(), managerVikram);
-    assert(reassignRes.success === true, 'Manager Vikram successfully reassigns team lead to another team agent');
+    // Vikram CANNOT reassign Lead 1 (already assigned to Sales Agent Rahul)
+    const reassignSalesLeadRes = await enquiryService.assignEnquiry(
+      lead1Id.toString(),
+      agentRohitId.toString(),
+      managerVikram
+    );
+    assert(
+      reassignSalesLeadRes.success === false && (reassignSalesLeadRes as any).statusCode === 403,
+      'Manager Vikram receives HTTP 403 when trying to reassign a lead already assigned to a sales agent'
+    );
+
+    // Seed Manager-held leads for Vikram -> direct report assignment and outside-agent check
+    const mgrSelfLeadId = new Types.ObjectId();
+    const mgrSelfLead2Id = new Types.ObjectId();
+    enquiryStore.push(
+      {
+        _id: mgrSelfLeadId,
+        name: 'Manager Held Lead 1',
+        mobile: '9876543901',
+        normalizedMobile: '9876543901',
+        status: 'ACTIVE',
+        isActive: true,
+        assignedTo: managerVikramId,
+        managerId: managerVikramId,
+        currentStage: 'NEW',
+        createdAt: new Date()
+      },
+      {
+        _id: mgrSelfLead2Id,
+        name: 'Manager Held Lead 2',
+        mobile: '9876543902',
+        normalizedMobile: '9876543902',
+        status: 'ACTIVE',
+        isActive: true,
+        assignedTo: managerVikramId,
+        managerId: managerVikramId,
+        currentStage: 'NEW',
+        createdAt: new Date()
+      }
+    );
+
+    // Vikram CAN assign a Manager-held lead to Rohit (active direct report in Vikram's team)
+    const reassignRes = await enquiryService.assignEnquiry(mgrSelfLeadId.toString(), agentRohitId.toString(), managerVikram);
+    assert(reassignRes.success === true, 'Manager Vikram successfully assigns manager-held lead to direct-report sales agent');
 
     // Vikram CANNOT reassign Lead 4 (belongs to Other Manager's team)
     const crossReassignRes = await enquiryService.assignEnquiry(lead4Id.toString(), agentRohitId.toString(), managerVikram);
     assert(crossReassignRes.success === false, 'Manager cannot reassign lead belonging to another team');
     assert((crossReassignRes as any).statusCode === 403, 'Returns HTTP 403 Forbidden for cross-team lead reassignment');
 
-    // Vikram CANNOT reassign team Lead 1 to an outside agent
-    const outsideAssignRes = await enquiryService.assignEnquiry(lead1Id.toString(), agentOtherId.toString(), managerVikram);
-    assert(outsideAssignRes.success === false, 'Manager cannot assign team lead to an outside agent');
+    // Vikram CANNOT assign a Manager-held lead to an outside agent (not reporting to Vikram)
+    const outsideAssignRes = await enquiryService.assignEnquiry(mgrSelfLead2Id.toString(), agentOtherId.toString(), managerVikram);
+    assert(outsideAssignRes.success === false, 'Manager cannot assign manager-held lead to an outside agent');
     assert((outsideAssignRes as any).statusCode === 403, 'Returns HTTP 403 Forbidden when target assignee is outside team');
   } catch (err: any) {
     assert(false, 'Reassignment scoping error', err.message);
@@ -883,17 +924,59 @@ async function runManagerDashboardTests() {
       'Controller list with assignedOnly=true and excludeAssignedTo excludes unassigned and target agent leads'
     );
 
-    // Controller single assign accepts `assignedTo` key cleanly alongside `assignedToId`
-    const singleAssignRes = makeMockRes();
+    // Controller single assign & bulkAssign reject Sales-held lead1Id for Manager (HTTP 403),
+    // and accept `assignedTo` body key cleanly on a Manager-held lead (HTTP 200)
+    const blockedSingleAssignRes = makeMockRes();
     await controller.assign(
       {
         user: managerVikram,
         params: { id: lead1Id.toString() },
         body: { assignedTo: agentRohitId.toString() }
       } as any,
+      blockedSingleAssignRes
+    );
+    assert(
+      blockedSingleAssignRes.statusCode === 403,
+      'Controller assign returns HTTP 403 when Manager tries to reassign a sales-held lead'
+    );
+
+    const blockedBulkAssignRes = makeMockRes();
+    await controller.bulkAssign(
+      {
+        user: managerVikram,
+        body: { enquiryIds: [lead1Id.toString()], assignedTo: agentRohitId.toString(), method: 'MANUAL' }
+      } as any,
+      blockedBulkAssignRes
+    );
+    assert(
+      blockedBulkAssignRes.statusCode === 403,
+      'Controller bulkAssign returns HTTP 403 when Manager tries to reassign a sales-held lead'
+    );
+
+    const mgrCtrlLeadId = new Types.ObjectId();
+    enquiryStore.push({
+      _id: mgrCtrlLeadId,
+      name: 'Manager Ctrl Held Lead',
+      mobile: '9876543903',
+      normalizedMobile: '9876543903',
+      status: 'ACTIVE',
+      isActive: true,
+      assignedTo: managerVikramId,
+      managerId: managerVikramId,
+      currentStage: 'NEW',
+      createdAt: new Date()
+    });
+
+    const singleAssignRes = makeMockRes();
+    await controller.assign(
+      {
+        user: managerVikram,
+        params: { id: mgrCtrlLeadId.toString() },
+        body: { assignedTo: agentRohitId.toString() }
+      } as any,
       singleAssignRes
     );
-    assert(singleAssignRes.statusCode === 200, 'Controller assign accepts assignedTo body key cleanly');
+    assert(singleAssignRes.statusCode === 200, 'Controller assign accepts assignedTo body key cleanly on manager-held lead');
 
     // Multi-page pagination check: Page 1 and Page 2 on assignedOnly=true never overlap & share total
     const page1AssignedRes = makeMockRes();

@@ -214,13 +214,13 @@ async function runAssignTests() {
     );
 
     // -----------------------------------------------------------------
-    // 2. MANAGER reassigns an existing enquiry (HTTP 200)
+    // 2. MANAGER assigns a manager-held enquiry (HTTP 200) & blocked on sales-held (HTTP 403)
     // -----------------------------------------------------------------
-    console.log("\n--- Test 2: MANAGER Reassigns Existing Enquiry ---");
+    console.log("\n--- Test 2: MANAGER Assigns Manager-Held Enquiry & Blocked on Sales-Held ---");
     const enquiry2 = createMockEnquiry(
       {
-        name: "Lead for Reassignment",
-        assignedTo: salesAgent1._id as Types.ObjectId,
+        name: "Lead Held by Manager",
+        assignedTo: managerUser._id as Types.ObjectId,
       },
       usersMap,
     );
@@ -239,11 +239,37 @@ async function runAssignTests() {
     );
     const body2 = (await res2.json()) as any;
 
-    assert(res2.status === 200, "MANAGER reassignment returns HTTP 200 OK");
+    assert(res2.status === 200, "MANAGER assignment of manager-held lead returns HTTP 200 OK");
     assert(body2.success === true, "Response specifies success: true");
     assert(
       body2.data.enquiry.assignedTo.id === salesAgent2.id,
-      "Enquiry successfully reassigned to Sales Agent 2",
+      "Enquiry successfully assigned from Manager to Sales Agent 2",
+    );
+
+    const salesHeldLead = createMockEnquiry(
+      {
+        name: "Lead Held by Sales Agent",
+        assignedTo: salesAgent1._id as Types.ObjectId,
+      },
+      usersMap,
+    );
+    enquiriesMap.set(salesHeldLead.id, salesHeldLead);
+
+    const res2Blocked = await fetch(
+      `${baseUrl}/api/v1/enquiries/${salesHeldLead.id}/assign`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${managerToken}`,
+        },
+        body: JSON.stringify({ assignedToId: salesAgent2.id }),
+      },
+    );
+    const body2Blocked = (await res2Blocked.json()) as any;
+    assert(
+      res2Blocked.status === 403 && body2Blocked.success === false,
+      "MANAGER attempting to reassign a lead held by a Sales Agent returns HTTP 403 Forbidden",
     );
 
     // -----------------------------------------------------------------
