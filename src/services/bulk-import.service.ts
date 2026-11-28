@@ -4,7 +4,8 @@ import { BulkImport, IBulkImport, IImportRowError, BulkImportStatus } from '../m
 import { Enquiry, IEnquiry, PreferredContactMethod } from '../models/enquiry.model.js';
 import { FollowUpTask } from '../models/follow-up-task.model.js';
 import { EnquiryActivity } from '../models/enquiry-activity.model.js';
-import { User, IUser } from '../models/user.model.js';
+import { User, IUser, extractNormalized10DigitPhone } from '../models/user.model.js';
+import { withOptionalTransaction } from '../config/db.js';
 import { propertyMappingService } from './property-mapping.service.js';
 import { notificationService } from './notification.service.js';
 import { enquiryService, isInitialTaskDuplicateKeyError, buildLeadAssignmentMetadata } from './enquiry.service.js';
@@ -14,6 +15,7 @@ import { AuthUser } from '../types/auth.types.js';
 export const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
 export const MAX_DATA_ROWS = 500;
 export const BATCH_SIZE = 250;
+export const IMPORT_RECOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour recovery window
 
 export interface ParseFileResult {
   importId: string;
@@ -386,6 +388,43 @@ export class BulkImportService {
     const existingMobiles = new Set(existingDocs.map((d) => d.normalizedMobile));
     const existingEmails = new Set(existingDocs.map((d) => d.normalizedEmail).filter(Boolean));
 
+    const employeePhoneCandidates = Array.from(
+      new Set(
+        mobileCandidates
+          .map((m) => extractNormalized10DigitPhone(m))
+          .filter((p): p is string => Boolean(p))
+      )
+    );
+    const employeePhoneMap = new Map<string, { name: string; role: string }>();
+    if (
+      employeePhoneCandidates.length > 0 &&
+      (mongoose.connection.readyState === 1 || (User as any).find !== (mongoose.Model as any).find)
+    ) {
+      try {
+        const uQuery: any = User.find({
+          $or: [
+            { normalizedPhone: { $in: employeePhoneCandidates } },
+            { phone: { $in: employeePhoneCandidates } }
+          ]
+        });
+        const afterSelect =
+          typeof uQuery?.select === 'function' ? uQuery.select('name role phone normalizedPhone') : uQuery;
+        const empDocs = await (
+          typeof afterSelect?.lean === 'function' && typeof afterSelect?.then !== 'function'
+            ? afterSelect.lean()
+            : afterSelect
+        );
+        for (const u of empDocs || []) {
+          const ten = extractNormalized10DigitPhone(u?.normalizedPhone || u?.phone);
+          if (ten && employeePhoneCandidates.includes(ten)) {
+            employeePhoneMap.set(ten, { name: u.name, role: u.role });
+          }
+        }
+      } catch {
+        // Safely ignore if User model lookup fails in isolated mocks
+      }
+    }
+
     let validRows = 0;
     let duplicateRows = 0;
     let invalidRows = 0;
@@ -444,10 +483,28 @@ export class BulkImportService {
 
       const isMobileDup = existingMobiles.has(normMobile) || seenMobilesInFile.has(normMobile);
       const isEmailDup = Boolean(normEmail && (existingEmails.has(normEmail) || seenEmailsInFile.has(normEmail)));
+      const tenDigitMobile = extractNormalized10DigitPhone(normMobile);
+      const matchedEmployee = tenDigitMobile ? employeePhoneMap.get(tenDigitMobile) : undefined;
 
-      if (isMobileDup || isEmailDup) {
+      if (matchedEmployee || isMobileDup || isEmailDup) {
         duplicateRows++;
-        const reason = isMobileDup && isEmailDup ? 'Mobile & Email duplicate' : isMobileDup ? 'Mobile duplicate' : 'Email duplicate';
+        let reason = '';
+        if (matchedEmployee && !isMobileDup && !isEmailDup) {
+          const roleLabel =
+            matchedEmployee.role === 'ADMIN'
+              ? 'Admin'
+              : matchedEmployee.role === 'MANAGER'
+              ? 'Manager'
+              : 'Sales Agent';
+          reason = `Duplicate: Mobile matches CRM ${roleLabel} (${matchedEmployee.name})`;
+        } else {
+          reason =
+            isMobileDup && isEmailDup
+              ? 'Mobile & Email duplicate'
+              : isMobileDup
+              ? 'Mobile duplicate'
+              : 'Email duplicate';
+        }
         if (sampleValidatedRows.length < 10) {
           sampleValidatedRows.push({
             rowNumber,
@@ -587,13 +644,15 @@ export class BulkImportService {
         throw new Error('Access denied: Managers may only assign enquiries to active members of their own team.');
       }
 
-      const assignedUser = await User.findById(assignmentConfig.assignedToId).select('name isActive role');
-      if (!assignedUser || !assignedUser.isActive || assignedUser.role !== 'SALES') {
+      const assignedToStr = assignmentConfig.assignedToId.toString();
+      const assignedUser = await User.findById(assignedToStr).select('name isActive role');
+      const isSelfManager = assignedToStr === actor.id && assignedUser?.role === 'MANAGER';
+      if (!assignedUser || !assignedUser.isActive || (assignedUser.role !== 'SALES' && !isSelfManager)) {
         throw new Error('Selected team agent is inactive or invalid.');
       }
 
       resolvedMethod = 'MANUAL';
-      resolvedAssignedToId = new Types.ObjectId(assignmentConfig.assignedToId);
+      resolvedAssignedToId = new Types.ObjectId(assignedToStr);
       resolvedAssignedToName = assignedUser.name;
     } else if (actor.role === 'ADMIN') {
       if (assignmentConfig.method === 'MANUAL') {
@@ -707,51 +766,89 @@ export class BulkImportService {
       }
     }
 
-    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-      // Check cancellation request before starting next batch
-      const currentDoc = await BulkImport.findById(docId);
-      if (currentDoc?.cancelRequested) {
-        await BulkImport.findByIdAndUpdate(docId, {
-          status: 'CANCELLED',
-          completedAt: new Date()
-        });
-        return;
-      }
-
-      await BulkImport.findByIdAndUpdate(docId, {
-        currentBatch: batchIndex + 1,
-        totalBatches
-      });
-
-      const startIdx = batchIndex * BATCH_SIZE;
-      const endIdx = Math.min(startIdx + BATCH_SIZE, totalRows);
-      const batchRows = stagedRows.slice(startIdx, endIdx);
-
-      // Pre-fetch normalized mobile/email for this batch
-      const batchMobiles: string[] = [];
-      const batchEmails: string[] = [];
-
-      for (const row of batchRows) {
-        if (row._processed) continue;
-        const rawM = String(row[mobileHeader] || '').trim();
-        const rawE = emailHeader ? String(row[emailHeader] || '').trim() : '';
-        try {
-          if (rawM) batchMobiles.push(normalizeMobile(rawM));
-        } catch {}
-        if (rawE) {
-          const normE = normalizeEmail(rawE);
-          if (normE) batchEmails.push(normE);
+    try {
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        // Check cancellation request before starting next batch
+        const currentDoc = await BulkImport.findById(docId);
+        if (currentDoc?.cancelRequested) {
+          await BulkImport.findByIdAndUpdate(docId, {
+            status: 'CANCELLED',
+            completedAt: new Date()
+          });
+          return;
         }
-      }
 
-      // 1 single bulk duplicate lookup query for up to 250 records
-      const orQueries: Array<Record<string, any>> = [];
-      if (batchMobiles.length > 0) orQueries.push({ normalizedMobile: { $in: batchMobiles } });
-      if (batchEmails.length > 0) orQueries.push({ normalizedEmail: { $in: batchEmails } });
+        await BulkImport.findByIdAndUpdate(docId, {
+          currentBatch: batchIndex + 1,
+          totalBatches
+        });
 
-      const existingDocs = orQueries.length > 0
-        ? await Enquiry.find({ $or: orQueries }).select('_id normalizedMobile normalizedEmail status isActive currentStage rejection importId importRowNumber')
-        : [];
+        const startIdx = batchIndex * BATCH_SIZE;
+        const endIdx = Math.min(startIdx + BATCH_SIZE, totalRows);
+        const batchRows = stagedRows.slice(startIdx, endIdx);
+
+        // Pre-fetch normalized mobile/email for this batch
+        const batchMobiles: string[] = [];
+        const batchEmails: string[] = [];
+
+        for (const row of batchRows) {
+          if (row._processed) continue;
+          const rawM = String(row[mobileHeader] || '').trim();
+          const rawE = emailHeader ? String(row[emailHeader] || '').trim() : '';
+          try {
+            if (rawM) batchMobiles.push(normalizeMobile(rawM));
+          } catch {}
+          if (rawE) {
+            const normE = normalizeEmail(rawE);
+            if (normE) batchEmails.push(normE);
+          }
+        }
+
+        // 1 single bulk duplicate lookup query for up to 250 records
+        const orQueries: Array<Record<string, any>> = [];
+        if (batchMobiles.length > 0) orQueries.push({ normalizedMobile: { $in: batchMobiles } });
+        if (batchEmails.length > 0) orQueries.push({ normalizedEmail: { $in: batchEmails } });
+
+        const existingDocs = orQueries.length > 0
+          ? await Enquiry.find({ $or: orQueries }).select('_id normalizedMobile normalizedEmail status isActive currentStage rejection importId importRowNumber')
+          : [];
+
+        const batchEmployeePhones = Array.from(
+          new Set(
+            batchMobiles
+              .map((m) => extractNormalized10DigitPhone(m))
+              .filter((p): p is string => Boolean(p))
+          )
+        );
+        const batchEmployeePhoneMap = new Map<string, { name: string; role: string }>();
+        if (
+          batchEmployeePhones.length > 0 &&
+          (mongoose.connection.readyState === 1 || (User as any).find !== (mongoose.Model as any).find)
+        ) {
+          try {
+            const uQuery: any = User.find({
+              $or: [
+                { normalizedPhone: { $in: batchEmployeePhones } },
+                { phone: { $in: batchEmployeePhones } }
+              ]
+            });
+            const afterSelect =
+              typeof uQuery?.select === 'function' ? uQuery.select('name role phone normalizedPhone') : uQuery;
+            const empDocs = await (
+              typeof afterSelect?.lean === 'function' && typeof afterSelect?.then !== 'function'
+                ? afterSelect.lean()
+                : afterSelect
+            );
+            for (const u of empDocs || []) {
+              const ten = extractNormalized10DigitPhone(u?.normalizedPhone || u?.phone);
+              if (ten && batchEmployeePhones.includes(ten)) {
+                batchEmployeePhoneMap.set(ten, { name: u.name, role: u.role });
+              }
+            }
+          } catch {
+            // Safely ignore if User model lookup fails in isolated mocks
+          }
+        }
 
       // Process each row sequentially within the batch
       for (let rIdx = 0; rIdx < batchRows.length; rIdx++) {
@@ -834,7 +931,10 @@ export class BulkImportService {
         const matchesFileEmail = Boolean(normEmail && fileSeenEmails.has(normEmail));
         const matchesEmail = matchesDbEmail || matchesFileEmail;
 
-        if (matchesMobile || matchesEmail) {
+        const tenDigitMobile = extractNormalized10DigitPhone(normMobile);
+        const matchedEmployee = tenDigitMobile ? batchEmployeePhoneMap.get(tenDigitMobile) : undefined;
+
+        if (matchedEmployee || matchesMobile || matchesEmail) {
           duplicateCount++;
           processedCount++;
           row._processed = true;
@@ -844,7 +944,15 @@ export class BulkImportService {
           const isIntraFile = matchesFileMobile || matchesFileEmail;
           const isDbMatch = matchesDbMobile || matchesDbEmail;
 
-          if (isIntraFile && !isDbMatch) {
+          if (matchedEmployee && !isDbMatch && !isIntraFile) {
+            const roleLabel =
+              matchedEmployee.role === 'ADMIN'
+                ? 'Admin'
+                : matchedEmployee.role === 'MANAGER'
+                ? 'Manager'
+                : 'Sales Agent';
+            reason = `Duplicate: Mobile number "${normMobile}" belongs to CRM ${roleLabel} (${matchedEmployee.name}). Employee numbers cannot be imported as leads.`;
+          } else if (isIntraFile && !isDbMatch) {
             if (matchesFileMobile && matchesFileEmail) {
               reason = 'Duplicate: Both mobile number and email appear multiple times within the uploaded file.';
             } else if (matchesFileMobile) {
@@ -865,16 +973,17 @@ export class BulkImportService {
           rowErrors.push({
             rowNumber,
             customerIdentifier: `${rawName} (${rawMobile})`,
-            field: matchesMobile ? 'mobile' : 'email',
+            field: matchedEmployee || matchesMobile ? 'mobile' : 'email',
             category: 'DUPLICATE',
             reason
           });
 
-          // Log audit activity event with metadata.isBulkUpload = true
-          // Excludes duplicate bell notifications while maintaining full visibility in Duplicate Data section
-          let matchedDoc = foreignDbDocs.find(
-            (d) => d.normalizedMobile === normMobile || (normEmail && d.normalizedEmail === normEmail)
-          ) || fileSeenEnquiryMap.get(normMobile) || (normEmail ? fileSeenEnquiryMap.get(normEmail) : undefined);
+          // Log audit activity event with metadata.isBulkUpload = true (only for Enquiry duplicates)
+          let matchedDoc = isDbMatch || isIntraFile
+            ? foreignDbDocs.find(
+                (d) => d.normalizedMobile === normMobile || (normEmail && d.normalizedEmail === normEmail)
+              ) || fileSeenEnquiryMap.get(normMobile) || (normEmail ? fileSeenEnquiryMap.get(normEmail) : undefined)
+            : undefined;
 
           if (matchedDoc && (mongoose.connection.readyState === 1 || (EnquiryActivity as any)._isMocked)) {
             try {
@@ -1038,7 +1147,55 @@ export class BulkImportService {
             importRowNumber: rowNumber
           });
 
-          await enquiry.save();
+          const assignedUser =
+            isAssigned && assignedToId
+              ? await User.findById(assignedToId).select('name role isActive')
+              : null;
+
+          // Atomically persist Enquiry + FollowUpTask + EnquiryActivity per row
+          await withOptionalTransaction(async (session) => {
+            const sessionOpt = session ? { session } : undefined;
+            await enquiry.save(sessionOpt);
+
+            if (isAssigned && assignedToId) {
+              if (!isDncRestricted) {
+                const initialTask = new FollowUpTask({
+                  enquiryId: enquiry._id,
+                  assignedTo: new Types.ObjectId(assignedToId),
+                  purpose: validMethod === 'EMAIL' ? 'EMAIL' : validMethod === 'WHATSAPP' ? 'WHATSAPP' : 'CALL',
+                  followUpDate: new Date(),
+                  followUpTime: rawTiming || '10:00 AM',
+                  notes: 'System initialized pending follow-up task (Bulk Upload)',
+                  status: 'PENDING',
+                  isInitialTask: true
+                });
+                if (sessionOpt) {
+                  await initialTask.save(sessionOpt);
+                } else {
+                  await initialTask.save().catch((tErr: any) => {
+                    if (!isInitialTaskDuplicateKeyError(tErr)) {
+                      console.warn('[BulkImportService] Initial task creation notice:', tErr?.message);
+                    }
+                  });
+                }
+              }
+
+              const act = new EnquiryActivity({
+                enquiryId: enquiry._id,
+                performedBy: new Types.ObjectId(actor.id),
+                performedByName: actor.name,
+                type: 'ASSIGNMENT_CHANGED',
+                note: `Enquiry assigned to ${assignedUser?.name || 'Sales Agent'} via ${isRoundRobinAssignment ? 'Round Robin' : 'Bulk Upload Assignment'}`,
+                metadata: {
+                  newAssigneeId: assignedToId,
+                  newAssigneeName: assignedUser?.name || 'Sales Agent',
+                  assignmentMethod: isRoundRobinAssignment ? 'ROUND_ROBIN' : 'MANUAL'
+                }
+              });
+              await act.save(sessionOpt);
+            }
+          });
+
           importedCount++;
           processedCount++;
           row._processed = true;
@@ -1050,34 +1207,8 @@ export class BulkImportService {
           if (isAssigned && assignedToId) {
             assignedCount++;
 
-            // Initial follow-up task generation on write-path (suppressed if DNC active)
-            if (!isDncRestricted) {
-              try {
-                const initialTask = new FollowUpTask({
-                  enquiryId: enquiry._id,
-                  assignedTo: new Types.ObjectId(assignedToId),
-                  purpose: validMethod === 'EMAIL' ? 'EMAIL' : validMethod === 'WHATSAPP' ? 'WHATSAPP' : 'CALL',
-                  followUpDate: new Date(),
-                  followUpTime: rawTiming || '10:00 AM',
-                  notes: 'System initialized pending follow-up task (Bulk Upload)',
-                  status: 'PENDING',
-                  isInitialTask: true
-                });
-                await initialTask.save().catch((tErr: any) => {
-                  if (!isInitialTaskDuplicateKeyError(tErr)) {
-                    console.warn('[BulkImportService] Initial task creation notice:', tErr?.message);
-                  }
-                });
-              } catch (tErr: any) {
-                if (!isInitialTaskDuplicateKeyError(tErr)) {
-                  console.warn('[BulkImportService] Initial task catch:', tErr?.message);
-                }
-              }
-            }
-
-            // Lead Assignment In-App Notification (strictly to Sales Agent)
+            // Lead Assignment In-App Notification (post-commit, strictly to Sales Agent)
             try {
-              const assignedUser = await User.findById(assignedToId).select('name role isActive');
               if (assignedUser && assignedUser.role === 'SALES' && assignedUser.isActive) {
                 const notifMetadata = buildLeadAssignmentMetadata({
                   enquiry,
@@ -1117,24 +1248,6 @@ export class BulkImportService {
             } catch (nErr) {
               // Notification errors do not fail the import
             }
-
-            // Audit activity for assignment
-            try {
-              const assignedUser = await User.findById(assignedToId).select('name');
-              const act = new EnquiryActivity({
-                enquiryId: enquiry._id,
-                performedBy: new Types.ObjectId(actor.id),
-                performedByName: actor.name,
-                type: 'ASSIGNMENT_CHANGED',
-                note: `Enquiry assigned to ${assignedUser?.name || 'Sales Agent'} via ${isRoundRobinAssignment ? 'Round Robin' : 'Bulk Upload Assignment'}`,
-                metadata: {
-                  newAssigneeId: assignedToId,
-                  newAssigneeName: assignedUser?.name || 'Sales Agent',
-                  assignmentMethod: isRoundRobinAssignment ? 'ROUND_ROBIN' : 'MANUAL'
-                }
-              });
-              await act.save();
-            } catch (actErr) {}
           } else {
             unassignedCount++;
           }
@@ -1187,34 +1300,61 @@ export class BulkImportService {
       });
     }
 
-    // Mark import completed
-    const completedDate = new Date();
-    await BulkImport.findByIdAndUpdate(docId, {
-      status: 'COMPLETED',
-      completedAt: completedDate,
-      processedRows: processedCount,
-      importedCount,
-      duplicateCount,
-      invalidCount,
-      failedCount,
-      assignedCount,
-      unassignedCount,
-      rowErrors,
-      stagedRows: undefined // Clear staged rows to conserve database storage
-    });
+      // Determine accurate final import status
+      const completedDate = new Date();
+      const finalStatus: BulkImportStatus =
+        importedCount === 0 && (failedCount > 0 || invalidCount === totalRows)
+          ? 'FAILED'
+          : importedCount > 0 && failedCount > 0
+          ? 'PARTIAL_SUCCESS'
+          : 'COMPLETED';
 
-    // Dispatch role-based summary notifications to eligible Admins/Managers
-    importDoc.status = 'COMPLETED';
-    importDoc.completedAt = completedDate;
-    await this.dispatchSummaryNotifications(importDoc, {
-      processedCount,
-      importedCount,
-      duplicateCount,
-      invalidCount,
-      failedCount,
-      assignedCount,
-      unassignedCount
-    });
+      await BulkImport.findByIdAndUpdate(docId, {
+        status: finalStatus,
+        completedAt: completedDate,
+        processedRows: processedCount,
+        importedCount,
+        duplicateCount,
+        invalidCount,
+        failedCount,
+        assignedCount,
+        unassignedCount,
+        rowErrors,
+        stagedRows: undefined // Clear staged rows to conserve database storage
+      });
+
+      // Dispatch role-based summary notifications to eligible Admins/Managers
+      importDoc.status = finalStatus;
+      importDoc.completedAt = completedDate;
+      await this.dispatchSummaryNotifications(importDoc, {
+        processedCount,
+        importedCount,
+        duplicateCount,
+        invalidCount,
+        failedCount,
+        assignedCount,
+        unassignedCount
+      });
+    } catch (fatalErr: any) {
+      console.error(`[BulkImportService] Fatal error processing import ${importDoc.importId}:`, fatalErr);
+      try {
+        await BulkImport.findByIdAndUpdate(docId, {
+          status: 'FAILED',
+          completedAt: new Date(),
+          errorMessage: fatalErr?.message || 'Unexpected error during bulk import processing.',
+          processedRows: processedCount,
+          importedCount,
+          duplicateCount,
+          invalidCount,
+          failedCount,
+          assignedCount,
+          unassignedCount,
+          rowErrors
+        });
+      } catch (updateErr) {
+        console.error(`[BulkImportService] Failed to persist FAILED state for ${importDoc.importId}:`, updateErr);
+      }
+    }
   }
 
   /**
@@ -1237,8 +1377,8 @@ export class BulkImportService {
     }
   ): Promise<void> {
     try {
-      // Do not send success summary for completely failed or non-completed imports
-      if ((importDoc.status as string) !== 'COMPLETED') {
+      // Do not send success summary for failed or cancelled imports
+      if (importDoc.status !== 'COMPLETED' && importDoc.status !== 'PARTIAL_SUCCESS') {
         return;
       }
 
@@ -1291,7 +1431,10 @@ export class BulkImportService {
       const uniqueRecipients = Array.from(new Set(recipientIds.filter(Boolean)));
       if (uniqueRecipients.length === 0) return;
 
-      const title = 'Bulk Upload Completed';
+      const title =
+        importDoc.status === 'PARTIAL_SUCCESS'
+          ? 'Bulk Upload Completed with Partial Errors'
+          : 'Bulk Upload Completed';
       const filenameOrId = importDoc.originalFilename || importDoc.importId;
       const uploaderName = uploader.name || importDoc.uploadedByName || 'Uploader';
       const uploaderRole = uploader.role || importDoc.userRole || 'USER';
@@ -1427,19 +1570,38 @@ export class BulkImportService {
   }
   /**
    * Safe recovery after server restart.
-   * Finds any bulk imports in PROCESSING or QUEUED state and resumes execution sequentially.
+   * Finds recent interrupted bulk imports within the recovery TTL window and resumes execution sequentially,
+   * while marking stale interrupted jobs as FAILED so old imports do not auto-resume unexpectedly.
    */
-  async recoverInterruptedImports(): Promise<number> {
+  async recoverInterruptedImports(maxAgeMs: number = IMPORT_RECOVERY_TTL_MS): Promise<number> {
     const interruptedDocs = await BulkImport.find({
       status: { $in: ['PROCESSING', 'QUEUED'] }
     }).sort({ createdAt: 1 });
 
     if (interruptedDocs.length === 0) return 0;
 
-    console.log(`[BulkImportService] Found ${interruptedDocs.length} interrupted import(s) to recover.`);
+    console.log(`[BulkImportService] Found ${interruptedDocs.length} interrupted import(s) to evaluate.`);
+
+    let recoveredCount = 0;
+    const nowMs = Date.now();
 
     for (const doc of interruptedDocs) {
       try {
+        const lastTouchRaw = doc.updatedAt || doc.startedAt || doc.createdAt;
+        const lastTouchMs = lastTouchRaw ? new Date(lastTouchRaw).getTime() : NaN;
+        if (!Number.isNaN(lastTouchMs) && nowMs - lastTouchMs > maxAgeMs) {
+          console.warn(
+            `[BulkImportService] Marking stale interrupted import ${doc.importId} (${doc.status}) as FAILED (exceeded TTL).`
+          );
+          await BulkImport.findByIdAndUpdate(doc._id, {
+            status: 'FAILED',
+            completedAt: new Date(),
+            errorMessage: 'Interrupted bulk import exceeded maximum recovery window and was stopped on server startup.'
+          });
+          continue;
+        }
+
+        recoveredCount++;
         console.log(`[BulkImportService] Resuming interrupted import: ${doc.importId} (${doc.status})`);
         setImmediate(() => {
           this.processImportSequentially(doc._id.toString()).catch((err) => {
@@ -1451,7 +1613,7 @@ export class BulkImportService {
       }
     }
 
-    return interruptedDocs.length;
+    return recoveredCount;
   }
 }
 

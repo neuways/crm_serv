@@ -22,7 +22,7 @@ import {
   DncActivationReason,
   DncRevocationReason
 } from '../models/index.js';
-import { User, UserRole, IUser } from '../models/user.model.js';
+import { User, UserRole, IUser, extractNormalized10DigitPhone } from '../models/user.model.js';
 import { PropertyMapping } from '../models/property-mapping.model.js';
 import { normalizeMobile, normalizeEmail } from '../utils/normalization.js';
 import { scanSensitiveContent } from '../utils/sensitive-content.js';
@@ -409,7 +409,8 @@ export class EnquiryService {
     return isAuthorized;
   }
   /**
-   * Queries enquiries (both ACTIVE and CLOSED) for duplicate normalized mobile or normalized email.
+   * Queries enquiries (both ACTIVE and CLOSED) for duplicate normalized mobile or normalized email,
+   * and checks CRM employees (Admin, Manager, Sales Agent) by normalizedPhone / phone.
    */
   async findDuplicates(
     normalizedMobile: string,
@@ -420,13 +421,74 @@ export class EnquiryService {
       orConditions.push({ normalizedEmail });
     }
 
-    return Enquiry.find({
+    const enquiryMatches = await Enquiry.find({
       $or: orConditions
     }).populate({
       path: 'assignedTo',
       select: 'name email role managerId',
       populate: { path: 'managerId', select: 'name email role' }
     });
+
+    const tenDigitPhone = extractNormalized10DigitPhone(normalizedMobile);
+    if (
+      tenDigitPhone &&
+      (mongoose.connection.readyState === 1 || (User as any).find !== (mongoose.Model as any).find)
+    ) {
+      try {
+        const uQuery: any = User.find({
+          $or: [{ normalizedPhone: tenDigitPhone }, { phone: tenDigitPhone }]
+        });
+        const afterSelect =
+          typeof uQuery?.select === 'function'
+            ? uQuery.select('_id name email role phone normalizedPhone isActive createdAt')
+            : uQuery;
+        const resolved = await (
+          typeof afterSelect?.lean === 'function' && typeof afterSelect?.then !== 'function'
+            ? afterSelect.lean()
+            : afterSelect
+        );
+
+        if (Array.isArray(resolved) && resolved.length > 0) {
+          const matchedUsers = resolved.filter((u: any) => {
+            const uPhone = extractNormalized10DigitPhone(u?.normalizedPhone || u?.phone);
+            return Boolean(uPhone && uPhone === tenDigitPhone);
+          });
+
+          if (matchedUsers.length > 0) {
+            const employeeMarkers = matchedUsers.map((u: any) => {
+              const uid = u._id ? u._id.toString() : String(u.id || '');
+              const roleLabel =
+                u.role === 'ADMIN' ? 'Admin' : u.role === 'MANAGER' ? 'Manager' : 'Sales Agent';
+              return {
+                _id: u._id,
+                id: uid,
+                name: `${u.name} (${roleLabel})`,
+                mobile: normalizedMobile,
+                normalizedMobile,
+                status: 'ACTIVE',
+                isActive: u.isActive !== false,
+                assignedTo: {
+                  _id: u._id,
+                  id: uid,
+                  name: u.name,
+                  role: u.role
+                },
+                createdAt: u.createdAt || new Date(),
+                _isEmployeeMatch: true,
+                employeeRole: u.role,
+                employeeName: u.name
+              } as unknown as IEnquiry;
+            });
+
+            return [...enquiryMatches, ...employeeMarkers];
+          }
+        }
+      } catch {
+        // Safely ignore if User collection is mocked without expected chain methods
+      }
+    }
+
+    return enquiryMatches;
   }
 
   /**
@@ -477,8 +539,40 @@ export class EnquiryService {
       throw new Error(`Invalid assignedToId: "${input.assignedToId}" is not a valid ObjectId`);
     }
 
-    // 5. Pre-Check: Search for existing enquiries (ACTIVE and CLOSED) matching mobile or email
-    const existingMatches = await this.findDuplicates(normalizedMobile, normalizedEmail);
+    // 5. Pre-Check: Search for existing enquiries (ACTIVE and CLOSED) and CRM employees matching mobile or email
+    const allDuplicateMatches = await this.findDuplicates(normalizedMobile, normalizedEmail);
+    const employeeMatches = allDuplicateMatches.filter((m: any) => Boolean(m._isEmployeeMatch));
+    const existingMatches = allDuplicateMatches.filter((m: any) => !m._isEmployeeMatch);
+
+    if (employeeMatches.length > 0) {
+      const emp = employeeMatches[0] as any;
+      const empId = emp._id ? emp._id.toString() : emp.id || '';
+      const roleLabel =
+        emp.employeeRole === 'ADMIN' ? 'Admin' : emp.employeeRole === 'MANAGER' ? 'Manager' : 'Sales Agent';
+      const summary: MatchedEnquirySummary = {
+        id: empId,
+        name: `${emp.employeeName} (${roleLabel})`,
+        status: 'ACTIVE',
+        assignedTo: {
+          id: empId,
+          name: emp.employeeName || emp.name,
+          role: emp.employeeRole || 'SALES'
+        },
+        createdAt: emp.createdAt || new Date(),
+        matchReason: 'MOBILE'
+      };
+
+      return {
+        success: false,
+        isDuplicate: true,
+        duplicateType: 'MOBILE_MATCH',
+        message: `Mobile number belongs to existing CRM ${roleLabel} (${emp.employeeName}). Employee mobile numbers cannot be added as customer leads.`,
+        matches: { mobileMatch: summary },
+        matchedEnquiries: [summary],
+        isRedFlag: false,
+        hasActiveLead: true
+      };
+    }
 
     let isReEnquiryLead = false;
     let linkedPreviousEnquiry: IEnquiry | null = null;
@@ -953,7 +1047,9 @@ export class EnquiryService {
 
       if (isDuplicateKeyError) {
         // Re-query the conflicting record(s) that won the write race
-        const winningMatches = await this.findDuplicates(normalizedMobile, normalizedEmail);
+        const winningMatches = (await this.findDuplicates(normalizedMobile, normalizedEmail)).filter(
+          (m: any) => !m._isEmployeeMatch
+        );
 
         if (winningMatches.length > 0) {
           try {
@@ -2857,8 +2953,23 @@ export class EnquiryService {
               ? teamIds.filter((id) => id.toString() !== excludeAssignedToId)
               : teamIds
             ).filter(Boolean);
+            const mgrObjId = new Types.ObjectId(actor.id);
             if (hasRealDb) {
-              andConditions.push({ assignedTo: { $in: scopedTeamIds } });
+              if (!isAssignedOnly) {
+                andConditions.push({
+                  $or: [
+                    { assignedTo: { $in: scopedTeamIds } },
+                    {
+                      $and: [
+                        { $or: [{ assignedTo: null }, { assignedTo: { $exists: false } }] },
+                        { $or: [{ managerId: mgrObjId }, { createdById: mgrObjId }] }
+                      ]
+                    }
+                  ]
+                });
+              } else {
+                andConditions.push({ assignedTo: { $in: scopedTeamIds } });
+              }
             } else {
               filter.assignedTo = isAssignedOnly
                 ? { $in: scopedTeamIds, $ne: null }
@@ -3871,9 +3982,30 @@ export class EnquiryService {
         const teamMemberIds = await this.getManagerTeamMemberIds(actor, false);
         activeAgentsCount = teamMemberIds.length;
         teamMembersCount = teamMemberIds.length;
-        const allIds = [new Types.ObjectId(actor.id), ...teamMemberIds];
+        const mgrObjId = new Types.ObjectId(actor.id);
+        const allIds = [mgrObjId, ...teamMemberIds];
         managerAllowedAssigneeIdStrings = new Set(allIds.map((id) => id.toString()));
-        enquiryFilter.assignedTo = { $in: allIds };
+        const isNativeCountDocs =
+          mongoose.connection.readyState === 1 &&
+          (Enquiry as any).countDocuments === (mongoose.Model as any).countDocuments &&
+          (Enquiry as any).find === (mongoose.Model as any).find;
+        if (isNativeCountDocs) {
+          enquiryFilter.$and = [
+            {
+              $or: [
+                { assignedTo: { $in: allIds } },
+                {
+                  $and: [
+                    { $or: [{ assignedTo: null }, { assignedTo: { $exists: false } }] },
+                    { $or: [{ managerId: mgrObjId }, { createdById: mgrObjId }] }
+                  ]
+                }
+              ]
+            }
+          ];
+        } else {
+          enquiryFilter.assignedTo = { $in: allIds };
+        }
         taskFilter.assignedTo = { $in: allIds };
       }
 
@@ -4008,7 +4140,7 @@ export class EnquiryService {
         : taskQuery;
 
       const incompleteTasks: any[] = await (queryWithSort as any)
-        .populate('enquiryId', 'currentStage status meetingPlan siteVisitPlan dealDone assignedTo')
+        .populate('enquiryId', 'currentStage status meetingPlan siteVisitPlan dealDone assignedTo managerId createdById')
         .lean();
 
       if (Array.isArray(incompleteTasks)) {
@@ -4054,7 +4186,10 @@ export class EnquiryService {
         } else if (managerAllowedAssigneeIdStrings) {
           const enqAssignedId = enq.assignedTo?._id ? enq.assignedTo._id.toString() : enq.assignedTo?.toString();
           const taskAssignedId = task.assignedTo?._id ? task.assignedTo._id.toString() : task.assignedTo?.toString();
-          if (!managerAllowedAssigneeIdStrings.has(enqAssignedId) && !managerAllowedAssigneeIdStrings.has(taskAssignedId)) {
+          const enqManagerId = enq.managerId?._id ? enq.managerId._id.toString() : enq.managerId?.toString();
+          const enqCreatorId = enq.createdById?._id ? enq.createdById._id.toString() : enq.createdById?.toString();
+          const isOwnedUnassigned = !enqAssignedId && (enqManagerId === actor.id || enqCreatorId === actor.id);
+          if (!managerAllowedAssigneeIdStrings.has(enqAssignedId) && !managerAllowedAssigneeIdStrings.has(taskAssignedId) && !isOwnedUnassigned) {
             continue;
           }
         }

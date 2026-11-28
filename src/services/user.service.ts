@@ -1,5 +1,5 @@
 import mongoose, { Types } from 'mongoose';
-import { User, IUser, UserRole, EMPLOYEE_PHONE_REGEX } from '../models/user.model.js';
+import { User, IUser, UserRole, EMPLOYEE_PHONE_REGEX, extractNormalized10DigitPhone } from '../models/user.model.js';
 import { PropertyMapping } from '../models/property-mapping.model.js';
 import { Enquiry } from '../models/enquiry.model.js';
 import { EnquiryActivity } from '../models/enquiry-activity.model.js';
@@ -21,7 +21,8 @@ export class UserService {
       return null;
     }
 
-    if (!EMPLOYEE_PHONE_REGEX.test(trimmed)) {
+    const normalized = extractNormalized10DigitPhone(trimmed);
+    if (!normalized || !EMPLOYEE_PHONE_REGEX.test(normalized)) {
       const err = new Error(
         'Mobile number must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9.'
       );
@@ -29,7 +30,27 @@ export class UserService {
       throw err;
     }
 
-    return trimmed;
+    return normalized;
+  }
+
+  private async ensureUniqueEmployeePhone(normalizedPhone: string, excludeUserId?: string): Promise<void> {
+    const filter: Record<string, any> = {
+      $or: [{ normalizedPhone }, { phone: normalizedPhone }]
+    };
+    if (excludeUserId && Types.ObjectId.isValid(excludeUserId)) {
+      filter._id = { $ne: new Types.ObjectId(excludeUserId) };
+    }
+
+    const existing = await User.findOne(filter).select('_id name phone normalizedPhone');
+    if (
+      existing &&
+      (!excludeUserId || existing._id?.toString() !== excludeUserId) &&
+      extractNormalized10DigitPhone(existing.normalizedPhone || existing.phone) === normalizedPhone
+    ) {
+      const err = new Error(`An employee account with mobile number "${normalizedPhone}" already exists.`);
+      (err as any).statusCode = 409;
+      throw err;
+    }
   }
 
   private async findSupervisorById(supervisorId: string): Promise<IUser | null> {
@@ -207,6 +228,10 @@ export class UserService {
       throw err;
     }
 
+    if (validatedPhone) {
+      await this.ensureUniqueEmployeePhone(validatedPhone);
+    }
+
     let validatedManagerId: Types.ObjectId | null = null;
     let managerNameStr: string | null = null;
     let managerRole: UserRole | null = null;
@@ -247,6 +272,7 @@ export class UserService {
       name: trimmedName,
       email: normalized,
       phone: validatedPhone,
+      normalizedPhone: validatedPhone || undefined,
       passwordHash,
       role: input.role,
       isActive: true,
@@ -334,7 +360,12 @@ export class UserService {
     }
 
     if (input.phone !== undefined) {
-      user.phone = this.parseAndValidatePhone(input.phone);
+      const validatedPhone = this.parseAndValidatePhone(input.phone);
+      if (validatedPhone) {
+        await this.ensureUniqueEmployeePhone(validatedPhone, targetUserId);
+      }
+      user.phone = validatedPhone;
+      user.normalizedPhone = validatedPhone || undefined;
     }
 
     if (input.role !== undefined && user.role !== 'ADMIN') {

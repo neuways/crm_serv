@@ -6,6 +6,7 @@ export type BulkImportStatus =
   | 'QUEUED'
   | 'PROCESSING'
   | 'COMPLETED'
+  | 'PARTIAL_SUCCESS'
   | 'FAILED'
   | 'CANCELLED';
 
@@ -174,7 +175,7 @@ const bulkImportSchema = new Schema<IBulkImport>(
     },
     status: {
       type: String,
-      enum: ['PENDING_CONFIRMATION', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'],
+      enum: ['PENDING_CONFIRMATION', 'QUEUED', 'PROCESSING', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED', 'CANCELLED'],
       default: 'PENDING_CONFIRMATION',
       index: true
     },
